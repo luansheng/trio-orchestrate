@@ -1,17 +1,17 @@
 ---
 name: trio-orchestrate
-description: "一键拉起并编排一组参数化编队的智能体协作(默认三角色 kimi 编排+验收 / codex 审阅 / claude 执行,编队由 roster 声明,可 2~N 成员,可选成员含 genox)。当用户要开始一项新的多智能体任务,或说'安排三方协作/开工/拉起评审执行/立看板'时使用。可带参数:/skill:trio-orchestrate <任务tag> <roster>;第一参数是任务 tag,第二参数是编队声明。依赖 herdr(终端多路复用)建面板、起代理、传话、盯状态。用户只需启动 kimi 并加载本技能,其余面板自动建好。"
+description: "一键拉起并编排一组参数化编队的智能体协作(默认三角色 kimi 编排+验收 / codex 审阅 / claude 执行,编排者后端可在已判绿名单 kimi/claude 中按 roster 指定,编队 2~N 成员,可选成员含 genox)。当用户要开始一项新的多智能体任务,或说'安排三方协作/开工/拉起评审执行/立看板'时使用。可带参数:/trio-orchestrate <任务tag> <roster>(kimi 宿主写 /skill:trio-orchestrate);第一参数是任务 tag,第二参数是编队声明。依赖 herdr(终端多路复用)建面板、起代理、传话、盯状态。在任一已判绿的编排者后端会话里加载本技能即可,其余面板自动建好。"
 arguments:
   - tag
   - roster
 ---
 
-# 参数化编队协作:一键拉起 + 编排(默认 roster = kimi 编排 · codex 审 · claude 干)
+# 参数化编队协作:一键拉起 + 编排(默认 roster = kimi 编排 · codex 审 · claude 干;编排者后端可在已判绿名单 kimi/claude 中按 roster 指定,名单与判据见"编排者档案")
 
 > 作者:sheng luan
-> 协议版本:**2026-10-10-r6**
-> 依赖:kimi CLI + herdr;roster 里声明的其它 CLI 缺了走"组队与替补"。分享方式:整个 `trio-orchestrate/` 目录(含 `claude-exec-deny.json`)拷到对方 `~/.kimi-code/skills/` 即可。
-> 本技能同时是**拉起协议**与**运行协议**。分享出去后若担心普通对话误触发建 tab/切模式,可按需在 frontmatter 加 `disableModelInvocation: true`,改为只由显式命令调用。
+> 协议版本:**2026-10-10-r7**
+> 依赖:herdr + 本机任一**已判绿的编排者后端**(kimi/claude,判据=能力矩阵,见"编排者档案");roster 里声明的其它 CLI 缺了走"组队与替补"。分享方式:整个 `trio-orchestrate/` 目录(含 `claude-exec-deny.json`)拷到对方的技能目录——kimi 是 `~/.kimi-code/skills/trio-orchestrate/`,claude 是 `~/.claude/skills/trio-orchestrate/`(或项目内 `.claude/skills/`);拷后按看板头记的 `SKILL.md sha256` 核对,防旧副本混装。
+> 本技能同时是**拉起协议**与**运行协议**。分享出去后若担心普通对话误触发建 tab/切模式,可按需在 frontmatter 加禁用键:`disableModelInvocation: true`(kimi 宿主)或 `disable-model-invocation: true`(claude 宿主);键名写错会被静默忽略、技能照样自动触发。
 
 ## 槽位与 roster 声明(角色由 roster 参数决定)
 
@@ -29,12 +29,12 @@ arguments:
 **规则**:
 
 1. **覆盖约束**:每个 roster 必须 orch ≥1、rev ≥1、exec ≥1;成员数 **N ≥ 2**(单人不成队)。缺能力即拒,**报错点名缺哪种能力**。
-2. **必须单编排**(硬约束)。理由全部是现行纪律的直接推论,任一放松都会撕裂协议:看板单写者要求唯一写者,双 orch = 双写者;launch.lock 归属、manifest 创建/唯一解析、分类裁决需要一个唯一权威,双 orch 会出两种分类结论;模式选择是"唯一决策者"的三闸裁决,双 orch 会出现两套参数组结论;分层派活的 A 层裁决与派单权、ACK 收集与验收权都锚在唯一编排者上。**不设"多编排例外条款"**:现行"当前会话当编排者"例外只是 orch **实例来源**的例外(不新建 tab),不是 orch 数量的例外,r6 保持这个口径。
-3. **复合槽位 revtest 的自审无效**:允许"审阅+测试"由同一成员承担,但该成员**对自己执行产出的审阅不计数**——该类任务的审阅签字必须来自异槽 rev 能力成员,或升格由 orch 终审(标注"自审无效、orch 终审")。orch 终审权本来就在(编排+验收),本条款只是把"自审无效"写明。
+2. **必须单编排**(硬约束)。理由全部是现行纪律的直接推论,任一放松都会撕裂协议:看板单写者要求唯一写者,双 orch = 双写者;launch.lock 归属、manifest 创建/唯一解析、分类裁决需要一个唯一权威,双 orch 会出两种分类结论;模式选择是"唯一决策者"的三闸裁决,双 orch 会出现两套参数组结论;分层派活的 A 层裁决与派单权、ACK 收集与验收权都锚在唯一编排者上。**不设"多编排例外条款"**:现行"当前会话当编排者"例外只是 orch **实例来源**的例外(不新建 tab),不是 orch 数量的例外,r7 保持这个口径。
+3. **复合槽位 revtest 的自审无效**:允许"审阅+测试"由同一成员承担,但该成员**对自己执行产出的审阅不计数**——该类任务的审阅签字必须来自异槽 rev 能力成员,或升格由 orch 终审(标注"自审无效、orch 终审")。orch 终审权本来就在(编排+验收),本条款只是把"自审无效"写明。**签字独立性(校验器 ⑤b,2026-10-10 加)**:roster 里每个 exec 能力成员都必须有一个**非同源**的签字能力成员(rev 或 orch)可签它的产出;orch 对**同源**成员产出的终审只能记"同源验收、不作放行签",放行签必须来自非同源签字成员——无人值守编队不得用 orch 与 exec 同源的组合(校验器判红;原缺口:`orch=claude+revtest=claude` 这类全同源队形此前全绿)。
 
 ### roster DSL
 
-调用入口:`/skill:trio-orchestrate <tag> <roster>`。roster 是**单字符串 DSL**,成员之间用 `+` 连接(不用空格,规避参数分词不确定性),每成员:
+调用入口:`/trio-orchestrate <tag> <roster>`(kimi 宿主写 `/skill:trio-orchestrate`;参数怎样到达本文的三条路与反静默回落铁律见"编排者档案")。roster 是**单字符串 DSL**,成员之间用 `+` 连接(不用空格,规避参数分词不确定性),每成员:
 
 ```
 <slot>=<cli>[:<model>[:<effort>[:<family>]]]
@@ -42,7 +42,7 @@ arguments:
 
 - `slot`:槽位 ID,取自上面封闭词表;
 - `cli`:后端 CLI 名(kimi/codex/claude/copilot/opencode/genox…),即 herdr `--kind` 或后端档案名;
-- `model`:模型 slug,可选(kimi/claude 可省略用默认);
+- `model`:模型 slug,可选(kimi/claude 可省略用默认;**但 orch=claude 必须显式声明 model**——本机 claude 默认模型是最弱档,坐在最关键位子上,见"编排者档案");
 - `effort`:推理档(high/medium/low),可选;**与 model 分开传**的现行约定保留;
 - `family`:模型族显式声明,可选,**缺省 = `model` 原串**(供同源判定,见下)。
 
@@ -73,6 +73,14 @@ orch=kimi+rev=codex:gpt-6.1-sol:high+exec=claude
 ```
 展开:orch=kimi | rev=codex gpt-6.1-sol high | exec=claude | exec2=genox(genox 槽位参数组与限制见"后端档案")
 
+2 成员(编排者换后端:claude 顶 orch,kimi 额度耗尽时的走法;**orch=claude 必须显式声明 model**):
+```
+/trio-orchestrate tune2 orch=claude:claude-opus-5-5+revtest=codex:gpt-6.1-sol:high
+```
+展开:orch=claude claude-opus-5-5(主树)| revtest=codex gpt-6.1-sol high(独立 worktree;能力={rev,exec},放行签由非同源成员 orch 出;kimi 宿主把入口写成 `/skill:trio-orchestrate`)
+
+示例里的后端都可按本机**已判绿名单**替换(名单与判据见"编排者档案");调用写法:kimi 宿主 `/skill:trio-orchestrate …`,claude 宿主 `/trio-orchestrate …`,无技能宿主把 tag/roster 的**字面值**写进消息里(参数到达三条路见"编排者档案")。
+
 ### 成对约束(声明式)
 
 - **同源定义**(推广现行"不同后端"):成员 i、j 同源 ⇔ `cli_i == cli_j` **或** `family_i == family_j`(family 缺省 = model 原串)。即现行"不同后端 = 不同 CLI 且不同模型族"的等价形式,语义不变。
@@ -99,17 +107,38 @@ command -v herdr >/dev/null || { echo "未安装 herdr,停下告知用户"; exit
 [ "${HERDR_ENV:-}" = 1 ] || { echo "不在 herdr 内运行,停下告知用户"; exit 1; }
 herdr integration status           # 每个 agent 的状态钩子装没装:binary 在但钩子缺 → 状态侦测不可靠
 
+# ── 技能目录(最先解析:拼 --settings 路径要用;指**包目录**,不是入口文件路径)─────
+# 分层兜底:① 调用者显式给的 SKILL_ABS/SKILL_DIR;② 宿主引擎展开的变量——kimi 认 ${KIMI_SKILL_DIR},
+# claude 认 ${CLAUDE_SKILL_DIR}(2026-10-10 实测:claude 在代码块内也做展开、可用在引号里;两边各不认对方变量)。
+# 都取不到 → 点名停:${KIMI_SKILL_DIR} 在非 kimi 宿主是空串,拿它拼出的 --settings 会静默指向错误路径、
+# deny 清单一条都不生效——这是本轮实测的阻断项,不许静默留空继续跑。入口文件是 `$SKILL_DIR/SKILL.md`。
+export SKILL_ABS=${SKILL_ABS:-${SKILL_DIR:-${KIMI_SKILL_DIR:-${CLAUDE_SKILL_DIR:-}}}}
+export SKILL_DIR=$SKILL_ABS                # 别名:后端档案的参数组表按 $SKILL_DIR 拼 --settings 路径
+[ -n "$SKILL_ABS" ] || { echo "技能目录取不到(本宿主不展开 KIMI_SKILL_DIR/CLAUDE_SKILL_DIR,也没有显式 SKILL_ABS):先 export SKILL_ABS=<技能包目录的绝对路径> 再拉起(见\"编排者档案\")"; exit 1; }
+[ -f "$SKILL_ABS/SKILL.md" ] || { echo "技能目录 $SKILL_ABS 下没有 SKILL.md:SKILL_ABS 要指向技能**包目录**(不是入口文件),点错就停"; exit 1; }
+
 # ── 模型闸(第一道,先于任何含 $tag/$roster 的命令,由编排者=模型执行)──────────
-# $tag 与 $roster 在技能加载时已被文本展开进本文——下面那两行赋值本身就是 shell 源码:
-# 校验写在赋值之后,挡不住"赋值之前"就随 $tag/$roster 进入源码的文本。真正第一道是
-# 阅读判断:读到展开值后,先核对 TAG 整串符合 ^[a-z0-9_-]{1,24}$、ROSTER 整串符合下面
-# 那条 DSL 正则(空成员/空段/::/大写/空格/换行一律非法);非法就停下找用户重取——不敲下面
-# 任何一行,也不把非法值写进任何命令。这是模型闸,不是 shell 闸;不许"先赋值、再补校验"。
-# roster 未传到(引擎只回传首参数,行为[未实测])→ 按 R2 降级:当面问用户要 roster 声明,
-# 拿到的字符串过同一套模型闸 + shell 校验再继续,两个来源一视同仁,协议无分叉。
-TAG=$tag                           # 调用参数:/skill:trio-orchestrate <tag> <roster>(必须带 skill: 前缀);为空则等用户下达任务时点名。定后整局不变,同时用作 tab 标签与看板目录 /tmp/<TAG>/
-ROSTER=$roster                     # 第二参数;为空 → 用默认声明(见"槽位与 roster 声明")
-[ -n "$ROSTER" ] || ROSTER='orch=kimi+rev=codex:gpt-6.1-sol:high+exec=claude'
+# 参数到达本文有三条路(逐后端见"编排者档案"):① kimi——引擎在加载时把 $tag/$roster 文本展开进本文;
+# ② claude——同名 `arguments:` 声明 + 同样式展开(2026-10-10 实测:含代码块、命名参数按声明序取值);
+# ③ 无技能宿主(codex/copilot 等)——用户消息里给字面值,编排者**先把字面值写进下面两行赋值、再执行**。
+# 铁律:若下面两行里仍是字面 $tag/$roster(没被展开),不得把该段原样交给 shell 执行——那会把占位符
+# 当环境变量取空、静默出错(2026-10-10 实测:claude 把正文里所有 $数字 式片段都做文本替换,含代码块;
+# 故本文件所有 shell 位置参数写作 ${数字} 形式,awk 字段写作 $(数字) 形式,这两种写法各宿主都不替换)。
+# 此时停下,按 ①②③ 取字面值。**空 roster 的默认回落只对"用户确实没给"成立,对"取不到参数"不成立**——
+# 后者必须点名报错并给可用写法,不许静默回落成 kimi 默认编队。
+# 展开到位后,真正第一道闸是阅读判断:先核对 TAG 整串符合 ^[a-z0-9_-]{1,24}$、ROSTER 整串符合下面
+# 那条 DSL 正则(空成员/空段/::/大写/空格/换行一律非法);非法就停下找用户重取——不敲下面任何一行,
+# 也不把非法值写进任何命令。这是模型闸,不是 shell 闸;不许"先赋值、再补校验"。
+TAG=$tag                           # 调用参数:/trio-orchestrate <tag> <roster>(kimi 宿主写 /skill:trio-orchestrate);为空则等用户下达任务时点名。定后整局不变,同时用作 tab 标签与看板目录 /tmp/<TAG>/
+ROSTER=$roster                     # 第二参数;为空且用户确实没给 → 默认声明(见下);"取不到"不在此列(见上面的铁律)
+if [ -z "$ROSTER" ]; then
+  # 默认回落的前置检查(2026-10-10 加):默认编队的 orch 后端必须在本机可用(二进制在 + 状态钩子 current),
+  # 不可用就点名停、给一行改法,不起半支队(回落只对"用户确实没给"成立,见上面的铁律)
+  command -v kimi >/dev/null || { echo "默认编队需要 kimi,而本机 PATH 里没有它:显式给 roster 再拉起(例:orch=claude+rev=codex+exec=claude)"; exit 1; }
+  herdr integration status 2>/dev/null | grep -qE '^kimi[: ]+.*current' \
+    || { echo "默认编队需要 kimi,而 herdr 里 kimi 状态钩子不是 current(或 herdr 取不到):先 herdr integration install kimi 补装,或显式给 roster 换编排者后端(例:orch=claude+rev=codex+exec=claude)"; exit 1; }
+  ROSTER='orch=kimi+rev=codex:gpt-6.1-sol:high+exec=claude'
+fi
 # 二次防线(shell 层,挡的是赋值之后的继续使用;不能替代上面的模型闸):全字符串校验
 # (2026-10-09 实测:$'g07\n../outside' 能穿过旧 grep -qE 的行锚定;bash [[ =~ ]] 全字符串则拒绝)
 [[ "$TAG" =~ ^[a-z0-9_-]{1,24}$ ]] || { echo "TAG 不合法(空/含 [a-z0-9_-] 以外字符/超 24 字符/含换行),拒绝并要求用户重取"; exit 1; }
@@ -119,8 +148,10 @@ ROSTER=$roster                     # 第二参数;为空 → 用默认声明(见
 
 # ── roster 结构校验(解析后,python 一步做完,失败即停)────────────────────
 # 依次:① 槽位名 ∈ 词表、同 roster 内不重复、段数 ≤5 且无空段;② N ≥ 2;③ 能力覆盖 orch≥1/rev≥1/exec≥1;
-# ④ 单编排(orch 恰好 1)且 orch 的 CLI 必须是 kimi(技能就跑在 kimi 里;genox 等无钩子后端不得承担 orch);
-# ⑤ 成对约束枚举(rev 能力 × exec 能力,不得同源);⑥ 每成员全名 ^[a-z0-9_-]{1,32}$ 且 ≤32;
+# ④ 单编排(orch 恰好 1)且 orch 的 CLI ∈ 已判绿编排者名单 ORCH_ELIGIBLE(kimi/claude;未判绿后端不得承担 orch,
+#    见"编排者档案");orch 用 ORCH_REQUIRE_MODEL 里的后端时还须显式声明 model(本机 claude 默认模型是最弱档);
+# ⑤ 成对约束枚举(rev 能力 × exec 能力,不得同源);⑤b 签字独立性:每个 exec 成员都要有一个非同源、
+#    有签字能力(rev 或 orch)的成员可签它的产出(堵"整队同源、零交叉审");⑥ 每成员全名 ^[a-z0-9_-]{1,32}$ 且 ≤32;
 # ⑦ cli ∈ 本机后端档案表(见"后端档案";未知 CLI → "无档案,先补后端档案再拉起");
 # ⑧ 声明的 model/effort 必须在该 CLI 的档案里有对应启动 flag(没 flag 的字段点名拒绝,不静默丢弃——"后端档案"字段→启动 flag 表)。
 # 校验通过后输出规范化 roster 串(槽位序固定:orch 恒第一,其余按声明序),写进 manifest 的 roster: 行与 bootstrap,
@@ -131,8 +162,10 @@ ROSTER_DSL=$(cat <<'PY'
 import re, sys
 CAPS = {"orch": {"orch"}, "rev": {"rev"}, "rev2": {"rev"}, "revtest": {"rev", "exec"}, "exec": {"exec"}}
 for _i in range(2, 10):
-    CAPS[f"exec{_i}"] = {"exec"}                       # exec2…exec9 十个扩展执行线
+    CAPS[f"exec{_i}"] = {"exec"}                       # exec2…exec9 八个扩展执行线
 KNOWN_CLI = {"kimi", "codex", "claude", "copilot", "opencode", "genox"}   # 本机后端档案表;扩充档案时同步这里
+ORCH_ELIGIBLE = ("kimi", "claude")                      # 已判绿的编排者候选(顺序即报错文本里的名单顺序);进名单=跑过"编排者档案"能力矩阵逐格判绿,不是"有状态钩子"就算数
+ORCH_REQUIRE_MODEL = {"claude"}                         # orch 用这些后端时必须显式声明 model:本机 claude 默认模型是最弱档,不显式声明即拒(见"编排者档案")
 CLI_FIELDS = {                                          # 各 CLI 档案里**有**对应启动 flag 的字段(实测,见"后端档案"字段→启动 flag 表):
     "kimi": {"model"},                                  # 没列出的字段=该后端不支持,声明即拒,不静默丢弃
     "codex": {"model", "effort"},                       # codex: -m <model> -c model_reasoning_effort=<effort>
@@ -166,12 +199,14 @@ if len(members) < 2:
 for cap in ("orch", "rev", "exec"):
     if not any(cap in m["caps"] for m in members):
         sys.exit(f"编队缺少 {cap} 能力:每个 roster 必须有 orch ≥1、rev ≥1、exec ≥1")
-# ④ 单编排 + orch 后端限制
+# ④ 单编排 + orch 后端资格(报错文本由 ORCH_ELIGIBLE 常量生成,防文本与常量打架)
 _oslots = [m for m in members if "orch" in m["caps"]]
 if len(_oslots) != 1:
     sys.exit("必须单编排:orch 槽位恰好一个")
-if _oslots[0]["cli"] != "kimi":
-    sys.exit(f"orch 槽位的 CLI 必须是 kimi(实得 {_oslots[0]['cli']}):技能就跑在 kimi 里,无钩子后端不得承担 orch(见\"组队与替补\")")
+if _oslots[0]["cli"] not in ORCH_ELIGIBLE:
+    sys.exit(f"orch 槽位的 CLI 必须是本机档案里已判绿的编排者候选(当前名单:{'/'.join(ORCH_ELIGIBLE)};实得 {_oslots[0]['cli']}):候选资格按\"编排者档案\"逐项核(状态钩子、A 层派活、心跳、免确认档、入参到达);未判绿的后端不得承担 orch(见\"组队与替补\")")
+if _oslots[0]["cli"] in ORCH_REQUIRE_MODEL and not _oslots[0]["model"]:
+    sys.exit(f"orch 槽位用 {_oslots[0]['cli']} 时必须显式声明 model(该后端的本机默认模型不适合作编排者,见\"编排者档案\");写法例:orch={_oslots[0]['cli']}:claude-opus-5-5")
 # ⑤ 成对约束:rev 能力 × exec 能力 不得同源(复合槽位自配对跳过,走"自审无效"条款)
 revs = [m for m in members if "rev" in m["caps"]]
 execs = [m for m in members if "exec" in m["caps"]]
@@ -185,6 +220,15 @@ for i in revs:
                 f"组队冲突:槽位 {i['slot']}({i['cli']}/{i['model']}) 与槽位 "
                 f"{j['slot']}({j['cli']}/{j['model']}) 同源(共享 {shared}):审了等于没审。"
                 f"请更换其中一端的 CLI 或模型族,或在声明中给两端标注不同 family。")
+# ⑤b 签字独立性:每个 exec 成员都要有一个非同源、带 rev/orch 能力(能签字)的成员可以签它的产出
+signers = [m for m in members if m["caps"] & {"rev", "orch"}]
+for j in execs:
+    if not any(k["slot"] != j["slot"] and k["cli"] != j["cli"] and not (k["family"] and k["family"] == j["family"])
+               for k in signers):
+        sys.exit(
+            f"签字独立性缺失:exec 成员 {j['slot']}({j['cli']}/{j['model']}) 在编队里找不到非同源的签字成员"
+            f"(要 rev 或 orch 能力,且 CLI 与模型族都与它不同):同源评审不作放行签(见\"槽位与 roster 声明\"⑤b),"
+            f"请换一个不同源的 rev/orch 成员")
 # ⑥ 全名长度与字符集
 for m in members:
     name = f"{m['slot']}-{tag}"
@@ -227,24 +271,24 @@ echo "规范化 roster:$ROSTER_NORM"
 # 不能先取锁再分类:新取的锁自己让目录非空,合法新建会被"非空且无 manifest"判死(自阻塞)。
 # 排他:一个 TAG 同时只许一个拉起流程(并发共用 ACK 文件本身不允许);锁在拉起完成(ACK 通过)后释放,
 # 中途失败停下的先别删锁——人工处理完再删锁重入,防误重入
-# ══ 首次流程块(起;协议版本 2026-10-10-r6):把本块整段抽出去、设好 TAG/ROSTER/ROSTER_NORM 与 PWD(项目根 cwd)即可单独跑 ══
+# ══ 首次流程块(起;协议版本 2026-10-10-r7):把本块整段抽出去、设好 TAG/ROSTER/ROSTER_NORM 与 PWD(项目根 cwd)即可单独跑 ══
 TD="/tmp/$TAG"                                          # 任务目录(状态目录);本块一律用 $TD
 mkdir -p "$TD"                                          # 幂等
 
 # 目录/文件安全:读写的每个路径都查——不是符号链接(`[ -L ]`)、属主是自己;不存在的视为可创建;
 # 规范化后还必须落在任务目录里(跨出边界的路径先拒,写之前就停)
 guard() {
-  [ -e "$1" ] || [ -L "$1" ] || return 0
-  [ -L "$1" ] && { echo "拒绝:$1 是符号链接(可能指向任务目录外部)"; return 1; }
-  [ "$(stat -c %u -- "$1" 2>/dev/null)" = "$(id -u)" ] || { echo "拒绝:$1 属主不是当前用户"; return 1; }
+  [ -e "${1}" ] || [ -L "${1}" ] || return 0
+  [ -L "${1}" ] && { echo "拒绝:${1} 是符号链接(可能指向任务目录外部)"; return 1; }
+  [ "$(stat -c %u -- "${1}" 2>/dev/null)" = "$(id -u)" ] || { echo "拒绝:${1} 属主不是当前用户"; return 1; }
   return 0
 }
 TD_REAL=$(realpath -m "$TD")
 guard_td() {                                            # guard + 任务目录边界:规范化后必须等于 $TD 或在其下
-  guard "$1" || return 1
-  case "$(realpath -m "$1")" in
+  guard "${1}" || return 1
+  case "$(realpath -m "${1}")" in
     "$TD_REAL"|"$TD_REAL"/*) return 0 ;;
-    *) echo "拒绝:$1 规范化后不在任务目录 $TD_REAL 内"; return 1 ;;
+    *) echo "拒绝:${1} 规范化后不在任务目录 $TD_REAL 内"; return 1 ;;
   esac
 }
 # 静态清单含本次新增的落盘 JSON 快照(agent-list / pane-list)与缺失清单(missing-slots.txt):它们也要拒符号链接、
@@ -288,10 +332,10 @@ done
 # 重入一律从冻结 manifest 恢复,不看当前 git 状态(先分类、后算路径)
 EXPECT_MAIN=$(realpath -m "$PWD")
 expect_wt_of() {                                        # worktree 方案:orch 槽位在主树,其余在兄弟 worktree
-  if [ "$1" = orch ]; then echo "$EXPECT_MAIN"; else realpath -m "$PWD/../wt-$TAG-$1"; fi
+  if [ "${1}" = orch ]; then echo "$EXPECT_MAIN"; else realpath -m "$PWD/../wt-$TAG-${1}"; fi
 }
 expect_of() {                                           # 按已定/已恢复的 $PATH_PLAN 取该槽位预期路径
-  if [ "$PATH_PLAN" = worktree ]; then expect_wt_of "$1"; else echo "$EXPECT_MAIN"; fi
+  if [ "$PATH_PLAN" = worktree ]; then expect_wt_of "${1}"; else echo "$EXPECT_MAIN"; fi
 }
 
 # ① 分类:只读判断,先不写任何东西(先分类后算路径:main-only 建好之后再 git init,重入仍按 main-only)
@@ -487,7 +531,7 @@ for _hs in $HOOKLESS; do
   p=""
   if [ -s "$TD/panes.txt" ]; then
     # panes.txt 该槽位的映射必须恰好一条且两段非空:缺字段/重复映射都 fail-closed(不许挑一行凑合)
-    p=$(awk -v s="$s" '$1 == s {n++; id=$2} END {if (n != 1) exit 1; print id}' "$TD/panes.txt") \
+    p=$(awk -v s="$s" '$(1) == s {n++; id=$(2)} END {if (n != 1) exit 1; print id}' "$TD/panes.txt") \
       || { echo "panes.txt 里槽位 $s 的 pane 映射缺失或重复(<slot> <pane_id> 须恰好一条):fail-closed,人工确认"; exit 3; }
   fi
   [ -n "$p" ] || continue                               # 没有 pane 记录 → 交给解析器按"缺成员"报(新建时本来就没有 pane)
@@ -672,6 +716,18 @@ export REUSE MISSING_SLOTS
 建独立 tab 并按布局规则拉起 N 个**全新干净**代理(不从旧会话续)。**先在主树建好各槽位 worktree,再按对应 cwd 建面板、起代理**(worktree 只隔离工作文件与索引,不隔 git 元数据,不是安全边界,见"已知限制";项目目录**非 git** 时全部退回主树同 cwd 启动,隔离保证降低,**且无人值守自动退回有人在场模式**——见"无人值守模式"启用闸第 3 条,并在看板记一笔):
 
 ```bash
+# 0-pre) 启动前就绪检查(2026-10-10 加,**在任何副作用之前**:不建 worktree、不建 tab、不裂 pane):
+#   roster 语法通过 ≠ 本循环认得该 CLI 的启动参数组——有档案(copilot/opencode 等)但本循环还没登记 case 的后端,
+#   必须在动手之前就点名停;否则 worktree/tab/pane/半支队这些副作用已经发生,才发现"起不来"。
+#   本次将启动的槽位:新建=全部;重入补缺=缺的那些;全可复用=空(本检查无事可做)。
+if [ "$CLASSIFY" = new ]; then _pre_slots=$SLOTS; else _pre_slots=${MISSING_SLOTS:-}; fi
+for s in $_pre_slots; do
+  case "${CLI_OF[$s]}" in
+    kimi|codex|claude|genox) : ;;
+    *) echo "槽位 $s 的 CLI ${CLI_OF[$s]} 在本循环没有登记的启动参数组(语法/档案通过 ≠ 能启动):按'后端档案'对该 CLI 实测补一条 case(并把候选状态写进'编排者档案')后再拉起;本检查在任何副作用之前,未建 worktree/tab/pane"; exit 1 ;;
+  esac
+done
+
 # 0) 非 orch 槽位各一条 worktree(已存在则跳过);分支名带 tag 与槽位名,互不重叠。
 #    只按"首次流程块"定下的路径方案执行:非 git 降级(main-only)跳过,N 个 cwd 都用主树;重入一个都不建
 if [ "$CLASSIFY" = new ] && [ "$PATH_PLAN" = worktree ]; then
@@ -712,8 +768,14 @@ elif [ "${REUSE:-}" = refill ]; then
   # 重入补缺:**只**迭代 $MISSING_SLOTS,已在场成员一个都不动(不重发 agent start/pane run、不新建 pane/tab);
   # pane 一律用首次拉起落在 panes.txt 里的原 pane——重入不裂新 pane(几何不是协议身份,身份锚在 manifest/panes.txt)
   START_SLOTS=$MISSING_SLOTS
+  # orch 不自动补起(2026-10-10 加):补缺清单里含 orch → 点名 fail-closed,rc=3,等用户人工处理。
+  # 理由:自动重起 orch = 悄悄换编排者——在途派单、任务上下文、旧身份它都没有;补别的槽位而 orch 不在场,
+  # 也没有人能派活/放行。这不是"缺个成员",是编队停摆,只能人来决定(停,或按新任务重入换新身份号)。
+  case " $START_SLOTS " in
+    *" orch "*) echo "补缺清单含 orch:编排者不在场时补其余槽位没有意义(无人派活/放行),且自动重起等于中途换编排者——fail-closed,人工拉起/重入后再续"; exit 3 ;;
+  esac
   for s in $START_SLOTS; do
-    p=$(awk -v s="$s" '$1 == s {n++; id=$2} END {if (n != 1) exit 1; print id}' "$TD/panes.txt") \
+    p=$(awk -v s="$s" '$(1) == s {n++; id=$(2)} END {if (n != 1) exit 1; print id}' "$TD/panes.txt") \
       || { echo "panes.txt 里槽位 $s 的 pane 映射缺失或重复:fail-closed,人工确认"; exit 3; }
     [ -n "$p" ] || { echo "panes.txt 里槽位 $s 没有 pane ID:fail-closed,人工确认"; exit 3; }
     PANE_OF[$s]=$p
@@ -733,16 +795,16 @@ fi
 #    旧记录"3.0.1 的旧包裸命令报 `Missing command`、暂用 `genox chat`"是**历史测量**(当时那个包的行为),
 #    已被上一条取代,只作旧版本回溯用;不伪造 kind 注册、也不因它没进 agent list 就判"缺成员"。
 SLOT_ARGS=()                                            # 合成产物:每次调用前清空
-slot_argv_of() {                                        # $1 = slot:只从该槽位的规范 roster 声明合成(闸⑧已挡住"声明了却没有 flag"的入参)
+slot_argv_of() {                                        # ${1} = slot:只从该槽位的规范 roster 声明合成(闸⑧已挡住"声明了却没有 flag"的入参)
   SLOT_ARGS=()
-  case "${CLI_OF[$1]}" in
-    kimi)   if [ -n "${MODEL_OF[$1]}" ]; then SLOT_ARGS+=(-m "${MODEL_OF[$1]}"); fi ;;
-    codex)  if [ -n "${MODEL_OF[$1]}" ]; then SLOT_ARGS+=(-m "${MODEL_OF[$1]}"); fi
-            if [ -n "${EFFORT_OF[$1]}" ]; then SLOT_ARGS+=(-c "model_reasoning_effort=${EFFORT_OF[$1]}"); fi ;;
-    claude) if [ -n "${MODEL_OF[$1]}" ]; then SLOT_ARGS+=(--model "${MODEL_OF[$1]}"); fi
-            if [ -n "${EFFORT_OF[$1]}" ]; then SLOT_ARGS+=(--effort "${EFFORT_OF[$1]}"); fi ;;
-    *)      if [ -n "${MODEL_OF[$1]}${EFFORT_OF[$1]}" ]; then
-              echo "槽位 $1 的 CLI ${CLI_OF[$1]} 没有登记的模型/推理档合成规则:不静默丢弃,停下按'后端档案'补规则"
+  case "${CLI_OF[${1}]}" in
+    kimi)   if [ -n "${MODEL_OF[${1}]}" ]; then SLOT_ARGS+=(-m "${MODEL_OF[${1}]}"); fi ;;
+    codex)  if [ -n "${MODEL_OF[${1}]}" ]; then SLOT_ARGS+=(-m "${MODEL_OF[${1}]}"); fi
+            if [ -n "${EFFORT_OF[${1}]}" ]; then SLOT_ARGS+=(-c "model_reasoning_effort=${EFFORT_OF[${1}]}"); fi ;;
+    claude) if [ -n "${MODEL_OF[${1}]}" ]; then SLOT_ARGS+=(--model "${MODEL_OF[${1}]}"); fi
+            if [ -n "${EFFORT_OF[${1}]}" ]; then SLOT_ARGS+=(--effort "${EFFORT_OF[${1}]}"); fi ;;
+    *)      if [ -n "${MODEL_OF[${1}]}${EFFORT_OF[${1}]}" ]; then
+              echo "槽位 ${1} 的 CLI ${CLI_OF[${1}]} 没有登记的模型/推理档合成规则:不静默丢弃,停下按'后端档案'补规则"
               return 1
             fi ;;
   esac
@@ -764,8 +826,10 @@ done
 #   herdr agent start "orch-$TAG" --kind kimi  --pane "${PANE_OF[orch]}" -- "${KIMI_ARGS[@]}"
 #   herdr agent start "rev-$TAG"  --kind codex --pane "${PANE_OF[rev]}"  -- "${CODEX_ARGS[@]}"  -m gpt-6.1-sol -c model_reasoning_effort=high
 #   herdr agent start "exec-$TAG" --kind claude --pane "${PANE_OF[exec]}" -- "${CLAUDE_ARGS[@]}"
+#   orch=claude 的 roster 同法展开:--kind claude + --model <roster 里声明的值>(ORCH_REQUIRE_MODEL 强制显式声明,见"编排者档案");
+#   权限数组按**该槽位自己的角色**去后端档案表取(orch 与 exec 可以都是 claude,但各取各的参数组,不共用同一个数组变量)
 # 数组元素逐项成为独立 argv,含空格路径也不拆、空数组不产生参数;不要退回字符串拼接(见"模式选择"的实测)
-# 模型 slug 与推理档必须分开传:slug 不带档位,档位用独立配置键;`--settings` 用技能目录变量拼路径、不写死用户名
+# 模型 slug 与推理档必须分开传:slug 不带档位,档位用独立配置键;`--settings` 用 $SKILL_DIR 拼路径(首段 fail-fast 解出的技能包目录)、不写死用户名
 
 # 4) 本次要起的面板改名(新建=全部;重入补缺=只改缺的那些);pane label 与 agent 名是两个对象
 for s in $START_SLOTS; do
@@ -778,7 +842,12 @@ done
 #    定**任务身份号 task ID**(bootstrap-id)→ 等 ACK 与预期全文全等(cmp)——这才是"拉起完成"的判据
 TD="/tmp/$TAG"                             # 与"首次流程块"同一个任务目录;此处重设,本块可单独抽取自测
 mkdir -p "$TD"                             # 幂等
-SKILL_ABS=<发送方已知的技能绝对路径>        # 如 /home/<user>/.kimi-code/skills/trio-orchestrate;包内一律写绝对路径,不假设对端会展开 ${KIMI_SKILL_DIR}
+# 技能目录(= 技能**包目录**,不是入口文件路径;$SKILL_ABS/SKILL.md 才是入口文件)。与首段同一套分层兜底,
+# 本块被单独抽取时也自己解析一遍;取不到就点名停(理由见首段:空串拼出的 --settings 会静默失效)。
+export SKILL_ABS=${SKILL_ABS:-${SKILL_DIR:-${KIMI_SKILL_DIR:-${CLAUDE_SKILL_DIR:-}}}}
+export SKILL_DIR=$SKILL_ABS
+[ -n "$SKILL_ABS" ] || { echo "技能目录取不到(本宿主不展开它、也没有显式 SKILL_ABS):先 export SKILL_ABS=<技能包目录的绝对路径> 再拉起"; exit 1; }
+[ -f "$SKILL_ABS/SKILL.md" ] || { echo "技能目录 $SKILL_ABS 下没有 SKILL.md:SKILL_ABS 要指向技能**包目录**(不是入口文件路径)"; exit 1; }
 # ══ bootstrap ACK 闭环块(起):整段抽出去、设好 TD/TAG/SKILL_ABS/SLOTS 即可单独跑(对端 herdr 可用桩替)══
 CLASSIFY=${CLASSIFY:-new}                  # 单独抽取本块自测时的默认值:按"新建"走(不碰 manifest)
 START_SLOTS=${START_SLOTS-$SLOTS}          # 同上:**没给值**(单独抽取自测)才默认全部槽位。
@@ -843,7 +912,7 @@ if [ -n "$START_SLOTS" ]; then
   rm -f "$TD/bootstrap-ack.md"             # 清掉旧 ACK:只认本次写出的回执(换了身份号时,这步同时作废旧号回执)
   {
     echo "bootstrap-id: $TASK_ID"
-    echo "技能文件:$SKILL_ABS/SKILL.md(绝对路径;先激活技能并读这个文件,不要依赖占位符自动展开)"
+    echo "技能文件:$SKILL_ABS/SKILL.md(绝对路径;先读这个文件,不要依赖占位符自动展开;读文件只是取材料,不改变你的角色资格——角色由 roster 与“编排者档案”定)"
     echo "tag: $TAG"
     echo "看板:$TD/taskboard.md(骨架已建好)"
     echo "成员全名:$(echo $NAMES | tr ' ' '/')(编排 + 审阅 + 执行等;限 [机核] 的条目见看板规则)"
@@ -860,13 +929,25 @@ if [ -n "$START_SLOTS" ]; then
     echo "tag: $TAG"
     for n in $NAMES; do echo "$n"; done
   } > "$TD/ack-expected"
-  herdr agent prompt "orch-$TAG" "读 $TD/bootstrap.md 并按其指令执行" --wait --timeout 120000
-  ack="$TD/bootstrap-ack.md"
-  cmp -s "$TD/ack-expected" "$ack" || { echo "ACK 与预期全文不一致(矛盾/重复/多余行或缺行):拉起未完成"; exit 1; }
+  if [ "${ORCH_SELF:-0}" = 1 ]; then
+    # 例外路径(当前会话本人当 orch,走"组队与替补"末条的采用条件):**不给自己发 prompt**——
+    # 自己 prompt 自己 = 自己等自己,--wait 空转到超时、锁还留在原地。ACK 由本会话自己写、cmp 自己跑:
+    # 省掉的只是"发消息"这一步,验收一步不少。指令照旧落盘 bootstrap.md,给用户和事后审计留同一份凭据。
+    echo "orch 即本会话(例外路径):不执行 agent prompt。请本会话读 $TD/bootstrap.md,照模板把 ACK 写到 $TD/bootstrap-ack.md,然后跑下面这行,通过才算拉起完成:"
+    echo "  cmp -s $TD/ack-expected $TD/bootstrap-ack.md && rmdir $TD/launch.lock && echo 'ACK 全等,锁已释放'"
+  else
+    herdr agent prompt "orch-$TAG" "读 $TD/bootstrap.md 并按其指令执行" --wait --timeout 120000
+    ack="$TD/bootstrap-ack.md"
+    cmp -s "$TD/ack-expected" "$ack" || { echo "ACK 与预期全文不一致(矛盾/重复/多余行或缺行):拉起未完成"; exit 1; }
+  fi
 else
   echo "全可复用(本次没起任何代理):不重发 bootstrap——ACK 已由复用检查按同一身份号全文核过"
 fi
-rmdir "$TD/launch.lock"                    # ACK 通过 = 拉起完成,释放排他锁;中途失败停下的,人工处理完再删锁重入
+if [ "${ORCH_SELF:-0}" = 1 ] && [ -n "$START_SLOTS" ]; then
+  :                                        # 例外路径:ACK 还没写出/验过,锁留到上面打印的 cmp 那一步再解
+else
+  rmdir "$TD/launch.lock"                  # ACK 通过 = 拉起完成,释放排他锁;中途失败停下的,人工处理完再删锁重入
+fi
 # ══ bootstrap ACK 闭环块(止)══
 ```
 
@@ -878,17 +959,17 @@ rmdir "$TD/launch.lock"                    # ACK 通过 = 拉起完成,释放排
 - 裂 pane 成功但 `agent start` 失败(如 invalid_agent_name,此时进程未创建):面板不用重建,修好参数对同一 pane 重发 `agent start` 即可;
 - 验收:`herdr pane read` 各槽位面板,审阅槽位状态栏须见 `<模型> <推理档>` 两段,**再发一条无关紧要的测试消息确认不弹 400** 才算真可用(只看模型展示名不算数);**claude 系**执行槽须见 bypass permissions on(仅无人值守参数组;其他 CLI 的无人值守档是各自档案里那组显式参数——"bypass" 只是 claude 的说法,不要拿它去套别的后端)——**这只证明权限模式,不证明 deny 清单已挂载**。**claude 系槽位**的 deny 清单验收分两层:文件存在且 JSON 合法是**语法检查**(`python3 -c "import json;json.load(open('...'))"` 一行验);**效果检查**是编排者 `herdr pane read` 或让该 agent 跑 `/status`(`/permissions`),看 **settings sources 与生效规则列表**,把生效规则条目贴进看板当证据——语法检查 ≠ 效果检查,两回事。**claude 系槽位**验不到有效规则/清单未生效 → **暂停派单**:已在跑的该槽位先停(退出/杀掉)再按有人在场组(显式 `--permission-mode default`)重拉,重拉后重验模式与规则,验过才恢复派单——只改 shell 变量或只看板记一笔都动不了旧进程,不算降级;非 claude 系槽位的模式验收按各自档案的显式参数与实际显示逐条核对(如 codex 的 `-a on-request -c approvals_reviewer=user`),验不出即停;
 - bootstrap 的完成判据是 **ACK 与 `/tmp/$TAG/ack-expected` 全文全等(`cmp -s`;内容 = bootstrap ID、tag、N 个成员全名共 N+2 行)**——矛盾字段、重复字段、多余行、缺行、行尾空格全拒,不是某个状态观测,也不是存在性 grep:`agent get` 只作辅助观测——短 bootstrap 在 `--wait` 返回后通常已是 idle/done,等不到 working(旧版曾把 working 当硬条件,2026-10-09 判定为错误);ACK 齐全后再告知用户切到新 tab 把任务下达给 orch 槽位成员(它就是后续编排者;本条拉起会话只负责搭建);
-- 例外(**前置:模式选择已过;或按"模式选择"做过记录式授权——用户把授权自动执行的范围写进 `/tmp/$TAG/mode-selection.md`**;`--auto` = Never Ask、在场≠用户批准):若用户就是在某个 kimi --auto 会话里加载本技能、且要它本人当编排者,则不建新 tab——**先用 `herdr agent rename "$HERDR_PANE_ID" "orch-$TAG"` 注册 agent 身份**(pane/tab 的 rename 只是显示标签,与 agent 名是两个不同对象;只改标签不会把本会话注册进角色名),再以当前面板为 P0、按上面的 worktree/cwd 规则裂其余槽位、起其余代理、全部面板照旧重命名,**tab 也 `herdr tab rename` 为任务名**(该 tab 还混有其他无关 pane 时,改为在原名后追加 `<TAG>`)。该例外不豁免模式选择:三闸不过、且没有上面的记录式授权时,**停用例外并停工**(见"模式选择");rename 只注册 agent 身份,不改变本会话的 CLI 权限模式,也不构成用户批准。
+- 例外(**前置:模式选择已过;或按"模式选择"做过记录式授权——用户把授权自动执行的范围写进 `/tmp/$TAG/mode-selection.md`**;各后端的无人值守档语义见"后端档案",共同点是 Never Ask、在场≠用户批准):若用户就是在某个**名单内后端**(kimi/claude,见"编排者档案")的无人值守会话里加载本技能、且要它本人当编排者,则不建新 tab。**采用前先核身份,四项全对才接管**:① 本会话的 CLI kind 与模型族;② cwd;③ 本会话正带着的任务(还挂着别的任务 → 不采用);④ roster 里 orch 槽位的声明与 ①② 一致,且 `orch-$TAG` 这个角色名没被别的实例占用——**不符就拒绝采用(焦点正好停在这个 pane ≠ 该由它接管)**,改为另起会话当 orch。核过后**先用 `herdr agent rename "$HERDR_PANE_ID" "orch-$TAG"` 注册 agent 身份**(pane/tab 的 rename 只是显示标签,与 agent 名是两个不同对象;只改标签不会把本会话注册进角色名),再以当前面板为 P0、按上面的 worktree/cwd 规则裂其余槽位、起其余代理、全部面板照旧重命名,**tab 也 `herdr tab rename` 为任务名**(该 tab 还混有其他无关 pane 时,改为在原名后追加 `<TAG>`)。bootstrap 一步照跑,但**走"自己不给自己发 prompt"的分支**:执行 bootstrap 块前 `export ORCH_SELF=1`,块内会把"自写 ACK + 自跑 cmp"的指令打出来(ACK 内容仍要与 `ack-expected` 逐字节一致,验证一步不少);**同一任务里这种接管只采用一次、不中途更换**;本会话退出或转去别的任务前,先按"组队与替补"停派单并知会用户。该例外不豁免模式选择:三闸不过、且没有上面的记录式授权时,**停用例外并停工**(见"模式选择");rename 只注册 agent 身份,不改变本会话的 CLI 权限模式,也不构成用户批准。
 
 ## 组队与替补(编队成员不齐时)
 
-- **orch 槽位不可替**:技能就跑在 kimi 里,但二进制检测仍要走(当前会话能跑 ≠ PATH 里有可新起实例的 kimi);缺的是审阅/执行等其它能力才走本节;
+- **orch 槽位不可自动替补**:缺的是审阅/执行等其它能力才走本节;**重入/补缺时 orch 不在场 = 编队停摆**——补缺分支点名 fail-closed(rc=3)等用户人工处理,**不自动重起、也不从候选池挑一个顶上**:自动重起就是悄悄换编排者(在途派单、任务上下文、旧身份都没了),换不换人只能由用户决定(停,或按新任务重入换新身份号)。新建时 orch 仍由拉起流程在 P0 新起(新实例随后按 bootstrap 读技能与看板;名单与判据见"编排者档案"),二进制/钩子检测照走(能加载技能 ≠ PATH 里有能新起实例的该后端);
 - **可用性检测(启动前)按后端档案分流,两级不是对所有后端都成立**:**有状态钩子**的后端两级都核——① `command -v <cli>` 二进制在(PATH 里有能新起实例的 CLI;当前会话里能跑不算)、② `herdr integration status` 显示 `current`(状态钩子已装);缺②可 `herdr integration install <agent>` 补装,补不了则退成备胎——能起跑但 idle/working 侦测不可靠,通信协议第 3 步 `agent get` 的观测失效,只能 `pane read` 人工盯。**档案声明"无钩子"的后端(如 genox,见"后端档案")只核 ①**:②对它必然缺失、也不该去补装,它的到场判据在**启动后**另算(见下一条),**不得因为 ② 缺失就把该候选判成不可用**;
 - **候选要记录**:每个候选写明 CLI kind + provider/模型 + 该槽位能力与权限边界;"不同后端"靠这两项判定,不能只看二进制名;候选池按**能力**查(不是按固定角色):
 
 | 能力 | 首选 | 替补顺序(示例,以启动前检测的实测结果为准) |
 |---|---|---|
-| orch | kimi | 无(不可替) |
+| orch | kimi(默认)或名单内其它后端(claude;见"编排者档案") | 无(不自动补、不中途换:缺 orch 一律 fail-closed 等用户) |
 | rev | codex | copilot → opencode(先补钩子)→ 第二个 kimi |
 | exec | claude | codex → copilot → opencode(先补钩子)→ genox(有人在场档) |
 
@@ -916,7 +997,7 @@ rmdir "$TD/launch.lock"                    # ACK 通过 = 拉起完成,释放排
 8. 预登记数(先写死预期再跑)优先于事后解释;
 9. **复合槽位 `revtest` 的自审无效(看板流转落款)**:revtest 成员自产出的单子,**审阅签字列留空**,由 orch 终审后直接移"已验收",并在该行附标注"**自审无效、orch 终审**"——单写者规则不变,移列权仍在 orch 一人手上。
 
-**看板头的"拉起信息"段(roster 表)**:除上面 9 条规则外,看板头写一张 roster 表,逐槽位记:槽位 / agent 全名 / 后端 CLI / provider+模型 / 推理档 / worktree 路径 / 参数组(无人值守或有人在场)——这是重入、排障与"谁在干什么"的唯一速查表。
+**看板头的"拉起信息"段(roster 表)**:除上面 9 条规则外,看板头写一张 roster 表,逐槽位记:槽位 / agent 全名 / 后端 CLI / provider+模型 / 推理档 / worktree 路径 / 参数组(无人值守或有人在场)——这是重入、排障与"谁在干什么"的唯一速查表。**另起一行记"技能版本"**:本次实际运行的 `SKILL.md` 的 sha256(拉起时算一次:`sha256sum "$SKILL_ABS/SKILL.md"`),分享/换装后旧副本混装时靠它判"这个任务是哪份技能文本拉起的"(发布=整目录拷到目标后端的技能目录,再核对哈希一致)。
 
 ## 无人值守模式(全自动协作的预授权)
 
@@ -947,7 +1028,7 @@ rmdir "$TD/launch.lock"                    # ACK 通过 = 拉起完成,释放排
 3. **worktree 不是安全边界**:它只隔离工作文件与索引,**git 元数据(common dir 下的 config/refs)与主树共享**——实测执行线 `git config` 会被主树读到、`git update-ref refs/heads/main` 能改主树 main 引用、也能推本地远端 main。所以"主树只有编排者能动"是**纪律约定,机制上不成立**;要硬边界得用进程级沙箱/容器 + 独立 Unix 用户 + 受限远端凭据,并由用户明确选择授权范围后启用;
 4. **替补后端没有等价控制**:claude 缺席时 `--settings` 挂载失效,替补 CLI 没有同等 deny 机制;此时该槽位无人值守能力应停用或改为有人在场(见"组队与替补"末条);
 5. **`/tmp` 可能被系统清理**:看板、ACK、裁决都在 `/tmp/<TAG>/`,重启或清理服务会删;关键 manifest、最终裁决、恢复指针要另存项目内持久位置(见"上下文/token 纪律"第 1 条);
-6. **心跳 cron 归属会话**:计划任务属于当前会话,新建会话不继承,需重建(见第 3 步末条);
+6. **心跳 cron 归属会话**:计划任务属于当前会话,新建会话不继承,需重建(见第 3 步末条);各宿主的心跳机制不同名但同理(如 claude 宿主是会话内计划任务,会话没了心跳就没了)——**别把它当成跨会话可用的共享设施**;
 7. **无钩子成员没有状态语义**:herdr 的 agent kind 表与本机 integration 列表都不含 genox(23 kinds / 17 integrations 三重确认,证据 `/tmp/genox/T001-b-evidence/60-herdr-agent.stderr`、`/tmp/genox/T001-b-evidence/63-herdr-integration-install-help.stdout`、`/tmp/genox/T001-b-evidence/62-herdr-integration-status.stdout`),`herdr agent read` 对 genox 面板直接报 `agent_not_found`(证据 `/tmp/genox/T001-b-evidence/87-agent-read.stdout`);只能 `herdr pane read` 读屏幕(实测可行,证据 `/tmp/genox/T001-b-evidence/85-pane-read-visible.stdout`)。所以 genox 槽位的 idle/working 是**屏幕推断**,弱于钩子;协议闭环不依赖它(锚在落盘 ACK),但**调度时效降级**:派单前与收 ACK 前各 `pane read` 看一眼,一切以落盘 ACK 为准。`herdr pane wait-output --match/--regex --timeout` 是现成的阻塞原语(实测 `output_matched`,证据 `/tmp/genox/T001-b-evidence/89-wait-output.stdout`),可用它等"该往下走了"这个时点。
 
 以上第 1–3 条对应的硬边界(远端保护、凭据隔离、worktree 可用)没有验收之前,按"无人值守模式"的**启用闸**处理:退回有人在场模式,不默认放权。
@@ -962,8 +1043,8 @@ rmdir "$TD/launch.lock"                    # ACK 通过 = 拉起完成,释放排
 |---|---|---|---|---|
 | kimi | `--auto` | 不加 `--auto`(其语义是 Never Ask) | 无 | 有(`integration status` 见 kimi) |
 | codex | `--approve-for-me` | **显式** `-a on-request -c approvals_reviewer=user`(不接受继承:省略 flag ≠ 人工批准——本机用户 config 实测 `approval_policy = "never"`;审批者另由 `approvals_reviewer` 决定,**on-request 不等于每条命令都问人**) | 无 | 有 |
-| claude | `--dangerously-skip-permissions --settings ${KIMI_SKILL_DIR}/claude-exec-deny.json` | **显式** `--permission-mode default` + `--settings`(deny 只收紧不放松);≥2.1.283 不传 bypass 也可能继承 auto 或用户 `permissions.defaultMode`,**不接受继承**;启动后验收真实模式 | **有**(仅 claude 系) | 有 |
-| ↑ 注 | roster 里出现**多个 claude 系槽位**(如 `exec=claude` + `exec2=claude`)**各实例逐条挂载同一份 `--settings` deny 清单**:清单是**按实例挂载**的,不是"只绑某一个槽位"——现行"只绑 `exec` 槽位、不影响用户单开 claude"的结论正是按实例挂载的证明;新增 claude 系槽位时,启动循环里照样带 `--settings`,一个都不落 | | | |
+| claude | `--dangerously-skip-permissions --settings "$SKILL_DIR/claude-exec-deny.json"` | **显式** `--permission-mode default` + `--settings`(deny 只收紧不放松);≥2.1.283 不传 bypass 也可能继承 auto 或用户 `permissions.defaultMode`,**不接受继承**;启动后验收真实模式 | **有**(仅 claude 系) | 有 |
+| ↑ 注 | roster 里出现**多个 claude 系槽位**(如 `exec=claude` + `exec2=claude`)**各实例逐条挂载同一份 `--settings` deny 清单**:清单是**按实例挂载**的,不是"只绑某一个槽位"——现行"只绑 `exec` 槽位、不影响用户单开 claude"的结论正是按实例挂载的证明;新增 claude 系槽位时,启动循环里照样带 `--settings`,一个都不落。`$SKILL_DIR` 由首段的技能目录 fail-fast 解析出来(取不到就停,不许拿空变量拼路径);**`orch=claude` 时按同一张表取参数组**(三闸全过=无人值守档,任一不过=有人在场档),**不沿用 exec 槽位的数组**;这份 deny 清单只含永禁项、不挡 orch 的本职动作(写项目根/看板/合并),因此不需要为 orch 另立一份放宽清单,也不许反过来把 exec 槽位的 deny 摘掉 | | | |
 | ↑ 注(codex) | **网络出口(作者环境限定,不是通用事实)**:作者环境 codex 走 VPN、kimi/deepseek 不走——只有 codex 掉线时先查 VPN;各人按自己的出口情况类比排查(第 3 步的重递判据用这条) | | | |
 | copilot / opencode / 其它替补 | 以该 CLI `--help` 实测为准(**逐 CLI 验收**,不套用上面的值) | 同左,显式人工档 | 无 | 补 `herdr integration install <agent>` 后有 |
 | **genox** | **无**(见下) | 交互式**裸 `genox`**(有人在场档为其唯一可用档;旧包才需要 `genox chat`,见 genox 条) | **无** | **无**(herdr 无 genox kind/integration) |
@@ -979,6 +1060,30 @@ rmdir "$TD/launch.lock"                    # ACK 通过 = 拉起完成,释放排
 | **genox** | **无** | **无** | 交互命令不收模型参数,声明即拒 |
 
 **健康检查(按档案的"状态钩子有无"分流,不搞一刀切)**:① `command -v <cli>` 二进制在——**所有后端**都要核;② `herdr integration status` 显示 `current`——**只有档案声明"有钩子"的后端**才核,**无 kind 的后端(genox)②必然缺失,不核也不补装**,按备胎处理:`agent get` 观测失效,只能 `pane read`。两档还各分两个时点(见"组队与替补"):**启动前**只核二进制与账号/模型可用性;**启动后**才核 pane 在场、pane 内进程存活、落盘 ACK 身份——选人阶段不该要求尚未存在的 pane/ACK。
+
+### 编排者档案(谁能当 orch,以及它自己怎么被拉起)
+
+> orch 比其它槽位多三条硬要求:**能收 ACK**(可靠状态语义或落盘凭据)、**能派活**(A 层子代理/并行)、**能自己活着**(心跳)。下面逐格给判据,**名单只收全格判绿的后端**——"有钩子"或"能跑起来"都不够。本节取代旧写法"orch 必须是 kimi":判定改成按名单,`ORCH_ELIGIBLE`(校验器 ④)与本节矩阵同源,文本不会两处打架。
+
+| 格 | kimi | claude | codex(候选,未判绿) |
+|---|---|---|---|
+| 装法/叫起 | `~/.kimi-code/skills/`,会话里 `/skill:trio-orchestrate` | `~/.claude/skills/`(或项目 `.claude/skills/`),`/trio-orchestrate <tag> <roster>` | 无技能宿主:把 `$SKILL_ABS/SKILL.md` 的绝对路径喂给会话,引导即用 |
+| 入参到达 | 引擎加载时把 `$tag`/`$roster` 文本展开进正文 | 同名 `arguments:` 声明 + 同样式展开(2026-10-10 实测:代码块内也展开、命名参数按声明序取值);取不到就按首段铁律停下要字面值 | 用户消息里给字面值,编排者**先写死字面值再执行** |
+| A 层派活 | 有(现状) | 有(子代理工具,可并行多开) | [未实测](子命令表里没有子代理类) |
+| 定时/心跳 | 有(现状) | 有,但**归本会话**(计划任务随会话;新建会话不继承、空闲才触发、7 天到期;会话没了心跳就没了) | [未实测](疑似无内置,只能外部 cron 或人工) |
+| 免确认档 | `--auto` | `--dangerously-skip-permissions`(+ 必须显式 `--model`:本机默认模型是最弱档) | `--approve-for-me`[未实测为编排场景] |
+| deny 等价 | 无 | `--settings "$SKILL_DIR/claude-exec-deny.json"`(与 exec 槽位**同一份**;清单只留永禁项) | 无 |
+| 状态钩子 | 有(v7) | 有(v9) | 有(v8) |
+| 提示通道 | `agent prompt` | `agent prompt` | `agent prompt` |
+| 写 `$TD`/项目根 | ✓(现行) | ✓(`--add-dir "$TD"`;写项目根按三闸或有人在场) | [未实测] |
+
+**名单与进入条件**:`ORCH_ELIGIBLE = (kimi, claude)` 是**已逐项判绿**者;codex/copilot 记**候选(未判绿)**——进入条件是把上表逐格跑一遍、逐格留证,再同时改常量与本节矩阵。`ORCH_REQUIRE_MODEL = (claude)`:orch 用 claude 时必须显式声明 model,校验器 ④ 判红并点名(理由:本机 claude 默认模型是最弱档,却坐在最关键的位子上)。
+
+**orch 自己的启动与权限**:走同一张"后端档案"参数组表(三闸全过=无人值守档,任一不过=有人在场档,并在看板写明哪条闸);**orch 不豁免模式验收**(第 12 条同样适用于它,验不到 → 停派单);"新建"时 orch 由拉起流程在 P0 新起,或按"组队与替补"末条的采用条件由当前会话本人担任;"重入/补缺"时 orch 缺席一律 fail-closed(rc=3)等用户。**可写范围**:项目根(建 worktree/合并)+ `$TD`(看板/ACK);`--settings` 挂的那份 deny 清单只留永禁项,不挡这些本职动作。
+
+**看护与失联**:orch 每次心跳把时刻写进看板一行("orch 心跳");rev 能力成员或用户每 N 倍周期 `pane read` 一次 orch——心跳时刻超过 N 倍周期没更新,记"编排者失联"。处置:**停派单 → 看板标注 → 人工决定**(停,或按新任务重入换新身份号);不许无声接管,也不许让补缺代码把 orch 当普通槽位重起(补缺分支已显式判 `orch ∈ MISSING_SLOTS` → rc=3)。
+
+**兜底路径(无技能宿主的后端当 orch)**:把技能包目录的绝对路径(`$SKILL_ABS/SKILL.md`)喂给**任何**满足前置清单的会话(在 herdr 内、herdr 可用、技能目录可读、能跑 shell、能写 `$TD` 与项目根、有提示通道或 pane 通道);**开机检查**:路径不存在、或与本次运行的版本不是同一份(`SKILL.md` 的 sha256 对不上)→ 停。注意:**喂绝对路径只是"能取到材料",不等于授予角色资格**——资格按上表与 roster 判。
 
 ### genox 条目
 
@@ -1014,7 +1119,7 @@ rmdir "$TD/launch.lock"                    # ACK 通过 = 拉起完成,释放排
 
 **派活分级的判据(2026-10-09 固化)**:任务书里还含"该怎么设计"的方案决策(选哪种实现、怎么拆、阈值定多少)= **A 层**,留给编排者的子代理——**不许标 [机核] 派给 exec 能力成员**;[机核] 只标做法已写死、验收线机器可核的 C 层活(命令、路径、期望值齐全,不需要执行者做任何判断)。把设计活写成 [机核] 下达,等于让执行者替你做设计决策,回执再"机器可核"也补不回来。
 
-额度纪律:大文件阅读、长任务跑批放 C 层。子代理报 403 先**按类型分**——配额墙 / 鉴权失败 / 网络故障:配额墙先保存进度、退避等待,恢复后再用 `Agent(resume=...)` 续跑,不重开;**不做无限重试**;鉴权/网络按各自原因处理;换了模型/代理/参数,记为新的执行条件,不自动继承旧验收。
+额度纪律:大文件阅读、长任务跑批放 C 层。子代理报 403 先**按类型分**——配额墙 / 鉴权失败 / 网络故障:配额墙先保存进度、退避等待,恢复后再用子代理工具的可续句柄续跑(工具名与可续条件**以本宿主为准**,如 claude 宿主是 `Agent(resume=...)`;没有可续句柄的后端按新任务重派,并在看板标注"重派,非续跑"),不重开;**不做无限重试**;鉴权/网络按各自原因处理;换了模型/代理/参数,记为新的执行条件,不自动继承旧验收。
 
 ## 上下文/token 纪律(上下文是缓存,看板是真相)
 
@@ -1031,7 +1136,7 @@ rmdir "$TD/launch.lock"                    # ACK 通过 = 拉起完成,释放排
 
 额度(5h 窗/日配额)耗尽与网络断连一样是**常态外部事件**,处理原则是吸收不是硬扛:
 
-1. **检测进心跳**:编排者 `pane read` 抓额度信号(codex 状态栏 `5h limit: N% left · resets at HH:MM`——**这是作者环境的示例,不是检测契约**:状态栏项可配置、版本/认证方式各异,以 `/status` 实测为准;未显示或取不到就标**未知**,不当成充足);kimi 403 只是候选信号,按"额度纪律"条先分"配额/鉴权/网络"再进处理链。同一账户可能同时有多个限制(如 5h 窗+周限),分别观察。**<30% 记看板并收紧派单**(只派关键单;关键验收暂停——这是本方调度政策,不是厂商保证的安全阈值);
+1. **检测进心跳**:编排者 `pane read` 抓额度信号(codex 状态栏 `5h limit: N% left · resets at HH:MM`——**这是作者环境的示例,不是检测契约**:状态栏项可配置、版本/认证方式各异,以 `/status` 实测为准;未显示或取不到就标**未知**,不当成充足);各后端的额度信号形态不一(状态栏、403、报错文本),**都只是候选信号**——按"额度纪律"条先分"配额/鉴权/网络"再进处理链(kimi 403 是作者环境观测到的一例,不是通用判据)。同一账户可能同时有多个限制(如 5h 窗+周限),分别观察。**<30% 记看板并收紧派单**(只派关键单;关键验收暂停——这是本方调度政策,不是厂商保证的安全阈值);
 2. **额度池独立性要核实,不能从 CLI 名推**:不同 CLI 可能挂同一计费账户(Claude 用 API key、Copilot BYOK 时,两个 CLI 烧的是同一池)。替补前按 **provider + 认证方式 + 计费账户/组织 + 额度桶与窗口** 逐项核对,确认候选不受原耗尽桶约束才算额度容灾;换客户端本身不算。核实记录不含密钥;
 3. **换脑恢复的前提是状态外置**:看板+manifest+task ID 在盘上,替补按**最后已确认检查点**恢复——注意中断现场可能是"执行完但未回执",接手前先核对产物/进程/提交并确认旧执行者已停写;必要重跑登记进看板。恢复承诺限于"不重复已核实完成的工作",不承诺任意中断都无损;
 4. **预案链按能力**:rev 能力断 → ①等重置窗口 ②备援审阅(向**另一 rev 能力成员**借调,可跨任务/跨 tab,先知会其编排者,召回即还)③替补审阅(降级标注,**不作最终放行签**);exec 能力断 → 按"组队与替补"换后端(rev/exec 不得同源的约束仍适用);
@@ -1054,7 +1159,7 @@ rmdir "$TD/launch.lock"                    # ACK 通过 = 拉起完成,释放排
 - 编排者亲自复核关键数字(复跑/复算),不转述;
 - "应该相同"≠"实测相同";静态声明与实测分开写;
 - **验收闸必须含行为探针**:校验谓词、ACK 比较、启动参数组这类可执行物,闸里要**构造对抗样本真跑**——矛盾字段、空值、重复行、错路径、抢锁、残留目录,每类都得有能判红/判绿的样本;只 grep 字符串不算验收(字符串在不在,与谓词判得对不对是两件事——2026-10-09 前四轮闸全绿、行为样本一跑就红)。对抗样本集在 `/tmp/skill-review/` 与 `/tmp/skillfix/r*-evidence/`,可抄;
-- **闸脚本本身也要被验**:写完闸先自证它能红能绿;模式串以 `-` 开头必须用 `grep -qF -- "$3"` 这样加 `--` 分隔,参数错位会让闸静默错检(2026-10-09 编排者自犯两次);改闸后至少回放一个"旧实现必红"的样本;
+- **闸脚本本身也要被验**:写完闸先自证它能红能绿;模式串以 `-` 开头必须用 `grep -qF -- "${3}"` 这样加 `--` 分隔,参数错位会让闸静默错检(2026-10-09 编排者自犯两次);改闸后至少回放一个"旧实现必红"的样本;
 - 被推翻的自己说过的话照实留更正记录。
 
 ## 第 5 步:冻结与并行
@@ -1070,13 +1175,13 @@ rmdir "$TD/launch.lock"                    # ACK 通过 = 拉起完成,释放排
 
 ## 发布前 smoke checklist
 
-分享/发布前逐项过。证据分四档,弃用笼统的 [已实测]:**[真实执行]** = 实际运行过命令/脚本,留有输入与结果路径;**[前缀建模]** = 只把命令串与规则清单/谓词做文本比对,没有真实运行;**[静态推演]** = 手工推理或一次性枚举,未固化成可重跑的记录;**[未实测]** = 尚未运行,只是规则要求。协议版本:**2026-10-10-r6**。
+分享/发布前逐项过。证据分四档,弃用笼统的 [已实测]:**[真实执行]** = 实际运行过命令/脚本,留有输入与结果路径;**[前缀建模]** = 只把命令串与规则清单/谓词做文本比对,没有真实运行;**[静态推演]** = 手工推理或一次性枚举,未固化成可重跑的记录;**[未实测]** = 尚未运行,只是规则要求。协议版本:**2026-10-10-r7**。
 
 > 行末带 **T001-d** 的,表示该行的探针由 T001-d 真跑。**那是 3453b4a 上的历史证据**,只覆盖 T001-d 回执 §六自列的覆盖范围——其中 **r5 六样本口径只重放了 3 档**(realpath 判等、缺成员、退出码 3),**行 17 未做**(那段是带占位符的注释伪代码,不可机械抽取);它不自动证明当前 commit 的验收。本轮 T001-i 已在新 commit 上复跑同批样本并加严,证据在 `/tmp/genox/T001-i-evidence/`,两处冲突时以本轮为准。**本表只写要求,落证前不宣称已执行**——见到 T001-d 而 T001-d 尚未回执时,按 [未实测] 读。
 
 | # | 检查项 | 状态与证据 |
 |---|---|---|
-| 1 | 参数校验:**tag 照旧 8 例**;**roster 追加至少 8 例**:含空格、含大写、含换行、非法槽位名、槽位重复、N=1、越界段数、空段/空值 —— **非法非空输入全拒**;**空串 = 按默认 roster 回落,不拒**;且**模型闸先于任何含 $tag/$roster 的命令** | **[真实执行] T001-d**(tag 的 8 例沿用 2026-10-09 证据 `/tmp/skillfix/r3-evidence/tag-validation.txt`,1 放行 7 拒绝)+ **T001-i 复跑**(空串回落样本 rc=0、其余非法非空样本 rc=1,见 `/tmp/genox/T001-i-evidence/` 的 roster 反例组)。"展开值先经模型阅读判断"这条本身[未实测](需真调 Kimi 模板引擎喂非法 `$tag`/`$roster`) |
+| 1 | 参数校验:**tag 照旧 8 例**;**roster 追加至少 8 例**:含空格、含大写、含换行、非法槽位名、槽位重复、N=1、越界段数、空段/空值 —— **非法非空输入全拒**;**空串 = 按默认 roster 回落,不拒**(回落前核默认编队的 orch 后端在本机可用,不可用点名停、给一行改法);**名单与 model 闸**:orch=claude 无 model 拒、orch 用名单外后端(genox/copilot/opencode/未登记)拒;且**模型闸先于任何含 $tag/$roster 的命令** | **[真实执行] T001-d**(tag 的 8 例沿用 2026-10-09 证据 `/tmp/skillfix/r3-evidence/tag-validation.txt`,1 放行 7 拒绝)+ **T001-i 复跑**(空串回落样本 rc=0、其余非法非空样本 rc=1,见 `/tmp/genox/T001-i-evidence/` 的 roster 反例组)+ **T002 复跑**(名单/model/回落前置检查样本见 `/tmp/genox/T002-evidence/`,轮次回执钉 commit 与哈希)。"展开值先经模型阅读判断"这条:**claude 宿主的正文替换机制已实测**(`/tmp/genox/T002-evidence/probe-claude-mechanics.txt`:代码块内也替换、`${数字}`/`$(数字)` 免疫);kimi 引擎侧仍[未实测](需真调 Kimi 模板引擎喂非法 `$tag`/`$roster`) |
 | 2 | 同 tag 重入:**N ∈ {2,3,4} 各跑一组**复用检查;r5 的 6 样本口径(realpath 判等、缺拓扑 fail-closed、跨 tab、缺角色)逐样本重放到 N=2 与 N=4;**pane 身份按 ID 唯一解析**(label/tab/workspace/pane cwd/进程 cwd/进程名逐项核)、**ACK 按已解析身份重建后全文比**、**身份不一致优先 rc=3 再算缺失**、**补缺只迭代缺失槽位** | **[真实执行] T001-i**(新 commit 上复跑 T001-d 同批样本 + 本轮加严反例:pane-id 不符 / pane cwd 不符 / 张冠李戴的同值 ACK / 空 ACK / 同槽位换后端 / 有成员错 cwd 且同时缺成员 → 全 rc=3;见 `/tmp/genox/T001-i-evidence/`);T001-d 历史覆盖见上注(**只重放 3 档**);**失败回滚**[未实测] |
 | 3 | 部分建队失败:进程未创建可同 pane 重发;进程在但 blocked/not-ready 先排障 | [未实测] |
 | 4 | 替补无解:枚举所有候选组合后才报无解 | **[真实执行]** 2026-10-09 脚本:审阅候选=[codex,kimi]、执行候选=[codex] 时,贪心误报无解、枚举得 kimi 审+codex 干(脚本与输出:`/tmp/skillfix/r3-evidence/role-pair-enum.txt`);**按槽位候选池 × 全组合**的泛化枚举实机演练[未实测] |
@@ -1088,15 +1193,15 @@ rmdir "$TD/launch.lock"                    # ACK 通过 = 拉起完成,释放排
 | 9 | bootstrap:ACK 与 `/tmp/<TAG>/ack-expected` **全文全等(`cmp -s`)**才算"拉起完成"——矛盾字段、重复字段、多余行、缺行、行尾空格全拒;**N ∈ {2,3,4} 的判绿样本 + 每 N 的判红样本**;任务身份看 manifest,重入**唯一解析**:必需字段各恰好一行、值非空、同名字段两次即拒;**重入期望按已解析身份重建再全文比**;**manifest 对抗样本**:roster 缺行 / 重复行 / 与 cwd 槽位集合不符 / cwd 行数 ≠ N / 同槽位换后端 / 同槽位换模型 —— 全拒;**已证伪的旧断言不再回放**:r5 解析器**不检查** roster 行(`/tmp/genox/T001-d-evidence/` 的 R2b 原样 rc=0),不许再写成"必红";要红就用 cwd 行数 ≠ N 等**真会拒**的样本 | **[真实执行] T001-d**(ACK 7 样本 `/tmp/skillfix/r4-evidence/cmp-ack.txt`、manifest 唯一解析 8 样本与目录安全 5 样本 `/tmp/skillfix/r5-evidence/manifest-unique-parse.txt`)+ **T001-i 复跑并加严**(身份重建、同槽位换后端/换模型、cwd 行数等反例见 `/tmp/genox/T001-i-evidence/`);实机拉起 ACK[未实测] |
 | 10 | 派单状态语义:`done` 可收单;ACK 绑 task ID + 当次批次;`working` 不作判据;**无钩子成员的收单条件 = pane read 未见活动输出 + 上一单 ACK 已落盘** | [未实测] |
 | 11 | 模式选择:三闸证据落 `/tmp/<TAG>/mode-selection.md` → 全过用无人值守参数组,任一不过用有人在场参数组(不对执行槽发 bypass/auto;**有人在场按各 CLI 档案显式给出**——claude 显式 `--permission-mode default`、codex 显式 `-a on-request -c approvals_reviewer=user`,都不接受继承本机未审默认) | **[静态推演]** 两参数组按闸结果二选一为人工推演;参数组表按 CLI 展开为人工推演;实机按两模式各拉起一次[未实测] |
-| 12 | claude 有效规则**效果检查**:`/status`(`/permissions`)看 settings sources 与生效规则,条目贴看板;验不到 → 退回有人在场并**先停再按显式人工模式重拉重验**;启动后验收真实模式(`pane read`/`/status`),验不出人工模式 = 闸失败停止派单 | [未实测](第 6 行的规则交集比对是[前缀建模],不等于引擎内生效) |
+| 12 | claude 有效规则**效果检查**:`/status`(`/permissions`)看 settings sources 与生效规则,条目贴看板;验不到 → 退回有人在场并**先停再按显式人工模式重拉重验**;启动后验收真实模式(`pane read`/`/status`),验不出人工模式 = 闸失败停止派单;**orch 槽位同样照此验收(编排者不豁免槽位规则;验不过 → 停派单)** | [未实测](第 6 行的规则交集比对是[前缀建模],不等于引擎内生效) |
 | 13 | 参数组为 bash 数组、`"${ARR[@]}"` 逐项成 argv:含空格路径不被拆、Zsh 标量不分词问题不复现;空参数组 `=()` 展开为空 | **[真实执行]** 2026-10-09:bash 5.2.21 与 zsh 5.9 × 两模式 × 两路径(含 `/tmp/skill space`)共 8 样本——数组形式两边都逐项正确;旧标量串在 bash 空格路径被拆成两项、在 zsh 整组变成一个参数(证据 `/tmp/skillfix/r4-evidence/argv-arrays.txt`) |
 | 14 | 有人在场落地:按各 CLI 档案显式给出人工档 **且**启动后验到真实人工模式才恢复派单;codex 显式审批策略/审批者并 `pane read` 核对显示(`on-request` 只保证"请求时才问",不等于每条命令都问人);既有会话不适用启动参数、先停再拉;orch rename 例外收窄为"模式验收已过 或 用户把授权范围落盘 `mode-selection.md`"(`--auto`=Never Ask,在场≠用户批准) | [未实测](文档依据:claude `v2.1.283` 起不传 bypass 也可能继承 auto 或用户 `defaultMode`;本机 codex 用户 config `approval_policy = "never"` 为只读窄读) |
 | 15 | **先分类后取锁**(N3):空目录 → 分类"新建" → 取锁 → 建 manifest → ACK 全等 → 释放的完整链;**用 N=4 roster 整段抽跑**;残留目录(非空无 manifest)在取锁前被拒;同 TAG 并发抢锁被拒;**先分类后算路径:方案在新建时冻结进 manifest,重入只恢复不重推**(main-only 建好后再 `git init` 也必须仍按冻结方案) | **[真实执行] T001-d**(r5 原证据:`/tmp/skillfix/r5-evidence/lock-flow.txt`,4 分支 + 闸的顺序探针)+ **T001-i**(N=4 整段抽跑 + "main-only 建后 git init 再重入"样本判绿,见 `/tmp/genox/T001-i-evidence/`);真代理拉起[未实测] |
-| 16 | **成对约束校验器**:判绿 = 现行默认 trio;判红 = 同 CLI 对、跨 CLI 同 family 对;**报错措辞与 SKILL 写死文本一致**;闸脚本自证能红能绿 | **[真实执行] T001-d**(每类 ≥1 样本)+ **T001-i**(同一套闸脚本复跑:默认 trio 判绿 rc=0,两类同源反例判红 rc=1;orch=genox 亦拒) |
+| 16 | **成对约束校验器**:判绿 = 现行默认 trio、orch=claude 显式 model、orch=kimi;判红 = 同 CLI 对、跨 CLI 同 family 对、**orch 名单外**(genox/copilot/opencode/未登记)、**orch=claude 无 model**、**签字独立性**(每个 exec 成员都要有非同源签字成员;`orch=claude+revtest=claude` 这类全同源队形拒);**报错措辞与 SKILL 写死文本逐字一致(中/英)**;闸脚本自证能红能绿 | **[真实执行] T001-d**(每类 ≥1 样本)+ **T001-i**(同一套闸脚本复跑:默认 trio 判绿 rc=0,两类同源反例判红 rc=1)+ **T002 复跑**(名单/model/签字独立性样本、新报错串逐字断言、旧句负向消失,见 `/tmp/genox/T002-evidence/`) |
 | 17 | **布局与命名**:N=2/3/4 的 pane 裂序(right→down 循环)与 rename 循环静态推演 + **N=3 与 r5 布局逐 pane 一致性核对** | **[静态推演]** + 真机拉起[未实测] |
 | 18 | **genox 槽位拉起**:启动命令真跑(当前交互命令 = **裸 `genox`**,2026-10-10 复测:进交互界面、EOF → `Goodbye!`;退出行为见"后端档案"genox 条,收尾不依赖它自行退出);免确认路径按 `/tmp/genox/T001-b-result.md` 回填;验证"有人在场 + pane 发指针 + 落盘 ACK"闭环可用桩对端跑通 | **[真实执行] T001-d**(依赖 T001-b);T001-b 已落证部分见"后端档案"genox 条(其中 `genox chat` 的裸命令 `Missing command` 记录已改为**旧包历史测量**);**端到端无人值守跑通仍 [未实测]**(本机无外网) |
 | 19 | **落盘快照的写入边界**:agent-list / pane-list / pane-info-\<slot\> / missing-slots 落盘前逐条核(拒符号链接、核属主、核在任务目录内);任务目录外放哨兵文件,负例跑完哨兵必须原样 | **[真实执行] T001-i**(符号链接负例:写前拒、外部 sentinel 字节不变;见 `/tmp/genox/T001-i-evidence/`) |
-| 20 | **逐槽位模型/推理档**:同一 CLI 的两个槽位各按自己的 roster 声明合成 argv(同 CLI 不同 model/effort 不互相顶掉);声明了模型/推理档却无对应 flag 的字段**明确拒绝**,不静默丢弃;`orch` 必须是 kimi | **[真实执行] T001-i**(同 CLI 双槽位 argv 反例 + orch=genox 拒;见 `/tmp/genox/T001-i-evidence/`) |
+| 20 | **逐槽位模型/推理档**:同一 CLI 的两个槽位各按自己的 roster 声明合成 argv(同 CLI 不同 model/effort 不互相顶掉);声明了模型/推理档却无对应 flag 的字段**明确拒绝**,不静默丢弃;`orch` 必须是已判绿名单内后端(kimi/claude;见"编排者档案") | **[真实执行] T001-i**(同 CLI 双槽位 argv 反例;见 `/tmp/genox/T001-i-evidence/`)+ **T002**(orch=genox 拒沿用 T001-i 样本;orch=claude 的 argv 走 orch 自己的参数组,见 `/tmp/genox/T002-evidence/`) |
 | 21 | **重组=显式换任务身份**:重入且本次真起了代理 → manifest 的 bootstrap-id 行原子改写为新号 → ACK 期望按新号重建 → 旧 ACK 随即作废;一个都没起(全可复用)时沿用原号、不重发 bootstrap | **[真实执行] T001-i**(换号后旧 ACK 判红、新 ACK 判绿;见 `/tmp/genox/T001-i-evidence/`) |
 
 ## 附录:原作者经验(不是通用事实,按自己的环境验证)
