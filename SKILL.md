@@ -763,7 +763,10 @@ mkdir -p "$TD"                             # 幂等
 SKILL_ABS=<发送方已知的技能绝对路径>        # 如 /home/<user>/.kimi-code/skills/trio-orchestrate;包内一律写绝对路径,不假设对端会展开 ${KIMI_SKILL_DIR}
 # ══ bootstrap ACK 闭环块(起):整段抽出去、设好 TD/TAG/SKILL_ABS/SLOTS 即可单独跑(对端 herdr 可用桩替)══
 CLASSIFY=${CLASSIFY:-new}                  # 单独抽取本块自测时的默认值:按"新建"走(不碰 manifest)
-START_SLOTS=${START_SLOTS:-$SLOTS}         # 同上:默认全部槽位
+START_SLOTS=${START_SLOTS-$SLOTS}          # 同上:**没给值**(单独抽取自测)才默认全部槽位。
+#   显式给成空串是"本次一个都不起"的正经取值(复用检查判全可复用时的 REUSE=ok 分支就是这么给的),
+#   不许被当成"没给值"再默认回全部——否则重入时成员都在场也会被当成起了代理:换掉任务身份号、作废旧 ACK、重发 bootstrap。
+#   所以这里用不带冒号的 `${VAR-default}`(只在未设时取默认),不要写成 `${VAR:-default}`(空串也会取默认)。
 # 任务身份号只有**一个**来源,三处必须同源:manifest 的 bootstrap-id 行、ACK 期望、给对方抄的样本。
 #   新建:身份号 = 首次流程块铸的 CREATE_ID(已写进 manifest),本块只读不改;
 #   重入且本次真起了代理(补缺/重组):**显式换新身份号**——先原子改写 manifest 的 bootstrap-id 行,再据此重建 ACK 期望。

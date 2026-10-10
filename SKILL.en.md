@@ -783,7 +783,11 @@ mkdir -p "$TD"                             # idempotent
 SKILL_ABS=<absolute path of the skill, known to the sender>   # e.g. /home/<user>/.kimi-code/skills/trio-orchestrate; always an absolute path inside the package, never assume the peer expands ${KIMI_SKILL_DIR}
 # ══ bootstrap ACK closure block (begin): lift this whole block out, set TD/TAG/SKILL_ABS/SLOTS, and it runs standalone (the peer's herdr can be stubbed) ══
 CLASSIFY=${CLASSIFY:-new}                  # default for lifting this block out on its own: go as a "new launch" (never touches the manifest)
-START_SLOTS=${START_SLOTS:-$SLOTS}         # same: default to every slot
+START_SLOTS=${START_SLOTS-$SLOTS}          # same: default to every slot only when the value was **never set** (standalone self-test).
+#   An explicit empty string is a legitimate value meaning "start nothing this round" (that is exactly what the REUSE=ok branch of the reuse check passes).
+#   It must not be read as "no value given" and defaulted back to every slot — otherwise a re-entry with everyone on stage looks like agents were started:
+#   the task identity number would be replaced, the old ACK voided, and bootstrap resent.
+#   Hence `${VAR-default}` without the colon (defaults only when unset); do not write `${VAR:-default}` (that also defaults on an empty string).
 # The task identity number has exactly **one** source, and three places must agree with it: the manifest's bootstrap-id line, the ACK expectation, and the sample handed to the peer.
 #   new launch: the identity number = the CREATE_ID minted by the first-run flow block (already in the manifest); this block only reads it;
 #   re-entry that really did start agents (refill/regroup): **explicitly mint a new identity number** — first rewrite the manifest's bootstrap-id line atomically, then rebuild the ACK expectation from it.
