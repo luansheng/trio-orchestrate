@@ -139,11 +139,13 @@ roster, tag = sys.argv[1], sys.argv[2]
 full = re.compile(r"^[a-z0-9_-]{1,32}$")
 members = []
 for part in roster.split("+"):
-    seg = part.split(":")
+    seg = part.replace("=", ":", 1).split(":")      # split the `=` once first (seg[0] held the whole `slot=cli` string, not the slot), then split on `:`
     slot, cli = seg[0], seg[1]
     model = seg[2] if len(seg) > 2 else ""
     effort = seg[3] if len(seg) > 3 else ""
     family = seg[4] if len(seg) > 4 else model      # family defaults to the model string
+    if slot not in CAPS:                            # unknown slot: refuse by name (Chinese message, instead of letting a KeyError traceback surface)
+        sys.exit(f"未知槽位名 {slot!r}:槽位取自封闭词表 orch/rev/rev2/revtest/exec/exec2…exec9")
     members.append(dict(slot=slot, cli=cli, model=model, effort=effort, family=family, caps=CAPS[slot]))
 # ① no duplicate slots
 slots = [m["slot"] for m in members]
@@ -226,6 +228,22 @@ ROOT=$(realpath -m "$PWD")                              # canonical absolute pro
 # panes.txt all follow it
 SLOTS=$(python3 -c 'import sys;print(" ".join(p.split("=")[0].split(":")[0] for p in sys.argv[1].split("+")))' "$ROSTER_NORM")
 N=$(echo $SLOTS | wc -w)
+SLOT_ARR=($SLOTS)                                       # slots in fixed order, indexable (slot names are [a-z0-9_] only, so word splitting is safe)
+declare -A CLI_OF                                       # slot → backend CLI: the start loop branches on the CLI (hookless backends start via the pane)
+while read -r _s _c; do CLI_OF[$_s]=$_c; done < <(python3 - "$ROSTER_NORM" <<'PY'
+import sys
+for part in sys.argv[1].split("+"):
+    seg = part.replace("=", ":", 1).split(":")
+    print(seg[0], seg[1])
+PY
+)
+declare -A EXPECT_OF                                    # slot → expected cwd: both the new and the re-entry path must fill it; the reuse check and the split loop always read it here
+NO_HOOK_CLI="genox"                                     # backends whose profile declares "no status hook": not in the herdr agent registry (see "Backend profiles")
+HOOKLESS=""
+for s in $SLOTS; do
+  case " $NO_HOOK_CLI " in *" ${CLI_OF[$s]} "*) HOOKLESS="$HOOKLESS $s";; esac
+done
+HOOKLESS=${HOOKLESS# }                                  # hookless slots (fixed slot order): the reuse check branches on this
 # The path plan is fixed before the manifest is generated (not "compute sibling worktrees first, then reject the non-git fallback
 # the document allows"):
 #   git repo → the orch slot's cwd = the main tree, and every non-orch slot gets a sibling worktree; non-git → all N cwds record
@@ -267,9 +285,16 @@ if [ "$CLASSIFY" = reentry ]; then
   # in fixed slot order, for the shell to read back line by line.
   _mout=$(python3 - "$TAG" "$ROOT" "$TD/manifest.txt" "$SLOTS" $(for s in $SLOTS; do echo "$s"; echo "$(expect_of "$s")"; done) <<'PY'
 import os, sys
-tag, root, path, slots = sys.argv[1:5]
+tag, root, path = sys.argv[1:4]
+slots = sys.argv[4].split()                             # $SLOTS arrives as a space-separated **string**: it must be split into a list, or list-vs-string never compares equal
 rest = sys.argv[5:]
+if not slots or len(set(slots)) != len(slots):
+    sys.exit(f"槽位表非法(为空或有重复):{slots}")
+if len(rest) != 2 * len(slots):
+    sys.exit(f"槽位与预期路径不是成对的 N 组:槽位 {len(slots)} 个、参数 {len(rest)} 项")
 want = dict(zip(rest[0::2], rest[1::2]))
+if set(want) != set(slots) or any(not p for p in want.values()):
+    sys.exit("槽位→预期路径映射不完整或含空值")
 seen = {}
 for line in open(path, encoding="utf-8"):
     line = line.rstrip("\n")
@@ -301,8 +326,12 @@ got = {}
 for v in cwds:
     name, sep, p = v.partition(" ")
     if sep != " " or not p.strip(): sys.exit(f"cwd 行缺分隔符或路径为空:{v!r}")
-    if name in got: sys.exit(f"cwd 槽位 {name} 重复")
-    got[name] = p.strip()
+    if not name.endswith("-" + tag):
+        sys.exit(f"cwd 行成员名 {name!r} 不符 <slot>-{tag} 命名:非本任务")
+    slot = name.rsplit("-" + tag, 1)[0]                 # the manifest records the full name <slot>-<tag>: normalize to the bare slot before comparing (differing conventions never match)
+    if not slot: sys.exit(f"cwd 行成员名 {name!r} 的槽位为空")
+    if slot in got: sys.exit(f"cwd 槽位 {slot} 重复")
+    got[slot] = p.strip()
 if set(got) != set(slots): sys.exit("cwd 槽位集合与 roster 行不符")
 if [k for k in got] != slots: sys.exit("cwd 行序与槽位固定序不符")
 for name in slots:
@@ -315,10 +344,18 @@ PY
   ) || { echo "manifest does not match this run (duplicate field/empty value/project root/roster/slot path/missing path): not recognized as this task, stop for manual confirmation"; exit 1; }
   # The expected cwds were verified by the same parser with the same algorithm above (re-entry does not re-assemble the path plan
   # and does not parse a second time — the awk second parse once drifted from the manifest line format, blanking all three EXPECT
-  # values, 2026-10-09 N4); read them back line by line and guard against empty values
-  EXPECT_MAIN=$(echo "$_mout" | sed -n '1p')
-  i=0; for s in $SLOTS; do i=$((i+1)); eval "EXPECT_$(echo $s | tr a-z A-Z)=$(echo "$_mout" | sed -n "${i}p")"; done
-  for s in $SLOTS; do eval "v=\$EXPECT_$(echo $s | tr a-z A-Z)"; [ -n "$v" ] || { echo "the re-entry read-back expected cwd for slot $s is empty: stop for manual confirmation"; exit 1; }; done
+  # values, 2026-10-09 N4); read them back line by line with r5's `IFS= read -r`, **no `eval`**: a path is data, not shell source
+  # (it may contain spaces, backslashes, a literal $()), and read-back must place it into the array untouched; guard against empty
+  # values and against too many/too few lines
+  i=0
+  while IFS= read -r _line; do
+    [ -n "$_line" ] || { echo "the re-entry read-back expected cwd is empty (line $((i+1))): stop for manual confirmation"; exit 1; }
+    [ "$i" -lt "$N" ] || { echo "re-entry read back more paths than N=$N: stop for manual confirmation"; exit 1; }
+    EXPECT_OF[${SLOT_ARR[$i]}]=$_line                   # placed line by line in fixed slot order (the generalization of r5's three EXPECT_* variables)
+    i=$((i+1))
+  done <<< "$_mout"
+  [ "$i" = "$N" ] || { echo "re-entry read back $i paths, expected $N: stop for manual confirmation"; exit 1; }
+  EXPECT_MAIN=${EXPECT_OF[orch]}                        # the orch slot's cwd is the main tree path (under the non-git plan every slot is it)
   echo "re-entry: manifest unique parse consistent, reusing the existing taskboard, filling gaps only, never overwriting"
 else
   CREATE_ID=$(date +%s)-$RANDOM                         # directory creation batch id: part of task identity, taken only on a new launch
@@ -332,6 +369,9 @@ else
     echo "created: $(date -Is)"
     echo "bootstrap-id: $CREATE_ID"
   } > "$TD/manifest.txt"
+  for s in $SLOTS; do EXPECT_OF[$s]=$(expect_of "$s"); done   # same as the re-entry branch: the new-launch branch must fill the per-slot
+                                                              # expected cwds too (r5 kept the three EXPECT_* in code shared by both branches; r6's
+                                                              # generalization left them only in the re-entry branch, 2026-10-09 T001-d D4)
   echo "new: task directory initialized (path plan $PATH_PLAN; lock held, released once the ACK passes)"
 fi
 # ══ First-run flow block (end) ══
@@ -343,33 +383,82 @@ fi
 # both sides are compared after realpath normalization — a path with `..` and a canonical cwd that point at the same directory
 # must compare equal, or a normal re-entry would be misjudged;
 # a missing tab_id/workspace_id exits non-zero (fail-closed); "it printed a conclusion" is not a pass
-herdr agent list | python3 -c '
+# Hookless slots ($HOOKLESS — profiles that declare they are not in the herdr registry, e.g. genox) are exempt from the
+# agent-list existence check and are verified three ways instead:
+#   ① pane identity: the pane recorded in panes.txt is still present, label == <slot>-<tag>, same tab, cwd as expected;
+#   ② pane process alive: the foreground process is non-empty and its name == the CLI declared for that slot (absent = missing, refill that one slot);
+#   ③ on-disk ACK identity: bootstrap-ack.md is byte-equal to this run's ack-expected (an ACK from another task is not accepted — no cross-task reuse)
+# Expected paths are passed item by item as argv from a **referenced bash array** (a path with spaces is not split); the parser first
+# asserts "slot count == path count, non-empty, unique" and only then compares.
+herdr agent list > "$TD/agent-list.json"
+herdr pane list  > "$TD/pane-list.json"
+for s in $HOOKLESS; do
+  p=$( [ -s "$TD/panes.txt" ] && awk -v s="$s" '$1 == s {print $2}' "$TD/panes.txt" )
+  [ -n "$p" ] || continue                               # no pane record → let the parser report it as a missing member (a fresh launch has no panes yet)
+  herdr pane process-info --pane "$p" > "$TD/pane-info-$s.json" \
+    || { echo "cannot get pane process-info for hookless slot $s: fail-closed, manual confirmation"; exit 3; }
+done
+EXPECT_ARGS=()
+for s in $SLOTS; do EXPECT_ARGS+=("${EXPECT_OF[$s]}"); done
+python3 -c '
 import json,os,sys
-agents=json.load(sys.stdin)["result"]["agents"]
-tag=sys.argv[1]; slots=sys.argv[2].split(); paths=sys.argv[3:]
-expect={f"{s}-{tag}": p for s,p in zip(slots,paths)}
+tag=sys.argv[1]; slots=sys.argv[2].split(); hookless=sys.argv[3].split()
+td=sys.argv[4]; paths=sys.argv[5:]
+if not slots or len(set(slots))!=len(slots) or len(paths)!=len(slots) or any(not p for p in paths):
+    print("复用检查入参不完整:槽位 %d 个、路径 %d 个(fail-closed,不复用)"%(len(slots),len(paths))); sys.exit(3)
+hook=dict(h.split("=",1) for h in hookless)
+agents=json.load(open(os.path.join(td,"agent-list.json")))["result"]["agents"]
+panes=json.load(open(os.path.join(td,"pane-list.json")))["result"]["panes"]
+expect={s:p for s,p in zip(slots,paths)}
 def norm(p):
     return os.path.realpath(p) if p else p
-got={a.get("name"):a for a in agents}
-missing=[w for w in expect if w not in got]
-if missing:
-    print("缺: "+", ".join(missing)); sys.exit(2)
 def bad(msg):
     print(msg); sys.exit(3)
-for w,exp in expect.items():
-    a=got[w]
+def pinfo(s):
+    f=os.path.join(td,"pane-info-"+s+".json")
+    if not os.path.exists(f): return {}
+    return json.load(open(f)).get("result",{}).get("process_info",{})
+got={a.get("name"):a for a in agents}
+missing=[s for s in slots if s not in hook and (s+"-"+tag) not in got]
+if missing:
+    print("缺: "+", ".join(s+"-"+tag for s in missing)); sys.exit(2)
+by_label={p.get("label"):p for p in panes}
+tabs=set()
+for s in slots:
+    if s in hook: continue
+    w=s+"-"+tag; a=got[w]
     if not a.get("tab_id") or not a.get("workspace_id"):
         bad(w+" 缺 tab_id/workspace_id,fail-closed:不复用")
-    cwd=a.get("cwd")
-    if norm(cwd)!=norm(exp):
-        bad(w+" cwd="+str(cwd)+" ≠ 预期 worktree="+str(exp)+"(realpath 规范化后仍不同):不复用")
-tabs={got[w].get("tab_id") for w in expect}
+    if norm(a.get("cwd"))!=norm(expect[s]):
+        bad(w+" cwd="+str(a.get("cwd"))+" ≠ 预期 worktree="+str(expect[s])+"(realpath 规范化后仍不同):不复用")
+    tabs.add(a.get("tab_id"))
+for s in sorted(hook):
+    w=s+"-"+tag; pane=by_label.get(w)
+    if pane is None:
+        print("缺: "+w+"(无钩子槽位:panes.txt 记的 pane 不在 list 里,按只补缺在该 pane 重起)"); sys.exit(2)
+    procs=pinfo(s).get("foreground_processes") or []
+    if not procs:
+        print("缺: "+w+"(无钩子槽位:pane 内无前台进程,按只补缺在该 pane 重起)"); sys.exit(2)
+    p0=procs[0]; pname=p0.get("name") or ((p0.get("argv") or [""])[0])
+    if pname!=hook[s]:
+        bad(w+" pane 前台进程="+str(pname)+" ≠ 该槽位 CLI="+hook[s]+":fail-closed,人工确认")
+    if norm(p0.get("cwd"))!=norm(expect[s]):
+        bad(w+" pane 进程 cwd="+str(p0.get("cwd"))+" ≠ 预期 worktree="+str(expect[s])+"(realpath 规范化后仍不同):不复用")
+    if not pane.get("tab_id") or not pane.get("workspace_id"):
+        bad(w+" pane 缺 tab_id/workspace_id,fail-closed:不复用")
+    tabs.add(pane.get("tab_id"))
 if len(tabs)!=1:
-    bad("成员不在同一 tab: "+", ".join(w+"@"+str(got[w].get("tab_id")) for w in expect))
-print(f"{len(expect)} 名成员齐全:同 tab,且各自 cwd 与预期 worktree 一致(realpath 规范化后)")' \
-  "$TAG" "$SLOTS" $(for s in $SLOTS; do eval "echo \$EXPECT_$(echo $s | tr a-z A-Z)"; done)
-# Exit codes: 0 = reusable; 2 = members missing (create only those); 3 = topology/directory mismatch or missing fields
-# (fail-closed, do not reuse automatically, rebuild after manual confirmation)
+    bad("成员不在同一 tab: "+", ".join(sorted(str(t) for t in tabs)))
+if hook:
+    ack=os.path.join(td,"bootstrap-ack.md"); want=os.path.join(td,"ack-expected")
+    ok=os.path.exists(ack) and os.path.exists(want) and open(ack,"rb").read()==open(want,"rb").read()
+    if not ok:
+        bad("无钩子槽位复用的落盘 ACK 身份不成立(bootstrap-ack.md 与本次 ack-expected 不全等):fail-closed,人工确认")
+print("%d 名成员齐全:同 tab,各自 cwd 与预期 worktree 一致(realpath 规范化后);无钩子槽位 pane 进程存活且落盘 ACK 身份已核"%len(slots))' \
+  "$TAG" "$SLOTS" "$HOOKLESS" "$TD" "${EXPECT_ARGS[@]}"
+# Exit codes: 0 = reusable; 2 = members missing (create only those; a hookless slot counts as missing when no process runs in its pane);
+# 3 = topology/directory mismatch, missing fields, or a hookless slot's on-disk ACK identity failing (fail-closed, do not reuse
+# automatically, rebuild after manual confirmation)
 # Expected cwds always come from the manifest: on a new launch they are written per the path plan fixed in the "first-run flow
 # block" (git → the main tree + N−1 sibling worktrees; non-git → all N cwds record the main tree, allowed only in attended
 # mode), and on re-entry they are read back through the unique parse — here the N expected paths are passed to the reuse check
@@ -412,13 +501,17 @@ if [ "$PATH_PLAN" = worktree ]; then
 fi
 
 # 1) New tab: the orch slot stays in the main tree; root pane P0 parsed from the returned JSON
-P0=$(herdr tab create --workspace "$HERDR_WORKSPACE_ID" --cwd "$EXPECT_ORCH" --label <task name> --no-focus \
+P0=$(herdr tab create --workspace "$HERDR_WORKSPACE_ID" --cwd "${EXPECT_OF[orch]}" --label <task name> --no-focus \
      | python3 -c 'import json,sys;print(json.load(sys.stdin)["result"]["root_pane"]["pane_id"])')
 # 2) Split-pane loop (P0 = the orch position): non-orch members in declaration order M1…M(N−1);
 #    M1: P0 --direction right → P1; Mk (k≥2): P(k−1) --direction down → Pk.
 #    At N=3 this matches the existing layout pane by pane; at N>3 the right column keeps extending downwards.
 #    Parse pane_id from the returned JSON at every split, never copy it by hand; also write $TD/panes.txt (`<slot> <pane_id>` one per line).
-PANE_OF_ORCH=$P0
+#    slot → pane is kept in the **associative array** PANE_OF (no more building variable names out of slot names): the start loop and
+#    the rename loop both read it, and each slot asserts non-empty — a name mix-up like storing into PANE_OF_ORCH and reading PANE_ORCH
+#    would blank the pane, so it must stop on the spot.
+declare -A PANE_OF
+PANE_OF[orch]=$P0
 : > "$TD/panes.txt"; echo "orch $P0" >> "$TD/panes.txt"
 prev=$P0; first=1
 for s in $SLOTS; do
@@ -426,28 +519,33 @@ for s in $SLOTS; do
   if [ "$first" = 1 ]; then dir=right; first=0; else dir=down; fi
   p=$(herdr pane split "$prev" --direction "$dir" --cwd "$(expect_of "$s")" --no-focus \
       | python3 -c 'import json,sys;print(json.load(sys.stdin)["result"]["pane"]["pane_id"])')
-  eval "PANE_$(echo $s | tr a-z A-Z)=$p"
+  [ -n "$p" ] || { echo "the pane_id parsed for slot $s is empty: stop for manual confirmation"; exit 1; }
+  PANE_OF[$s]=$p
   echo "$s $p" >> "$TD/panes.txt"
   prev=$p
 done
 
 # 3) Agent-start loop: look the slot up in "Backend profiles" and take parameters from the arrays chosen in "Mode selection";
 #    hard-coding bypass/auto is a process violation.
-#    `herdr agent start` needs --kind (kimi/codex/claude etc.); a member with no kind (genox) does not go through agent start,
-#    and is instead launched directly in its pane (see the genox entry under "Backend profiles": main path = generic pane launch
-#    + pane read status detection).
+#    The branch is on that slot's **cli** (not on the slot name): `herdr agent start` needs --kind (kimi/codex/claude etc.);
+#    a member whose profile declares "no hook" (genox) does not enter the registry and is started directly in its pane instead
+#    (`pane run genox chat`, see the genox entry under "Backend profiles") — never fake a kind to register it, and never call it
+#    "missing" just because it is absent from agent list.
 for s in $SLOTS; do
-  eval "pane=\$PANE_$(echo $s | tr a-z A-Z)"
-  case "$s" in
-    orch) herdr agent start "$s-$TAG" --kind kimi --pane "$pane" -- "${KIMI_ARGS[@]}" ;;
-    *)    # non-orch slot: expand from that slot's cli and model/effort in the roster (the two lines below are the default-roster instance)
-          herdr agent start "$s-$TAG" --kind <that slot's cli> --pane "$pane" -- "${ARGS_OF_that slot[@]}" ;;
+  pane=${PANE_OF[$s]}
+  [ -n "$pane" ] || { echo "slot $s has no pane (the split-pane loop never assigned it): stop for manual confirmation"; exit 1; }
+  case "${CLI_OF[$s]}" in
+    genox)  herdr pane run "$pane" "genox chat" ;;                    # no hook: the only usable set = attended; parameters in "Backend profiles"
+    kimi)   herdr agent start "$s-$TAG" --kind kimi   --pane "$pane" -- "${KIMI_ARGS[@]}" ;;
+    codex)  herdr agent start "$s-$TAG" --kind codex  --pane "$pane" -- "${CODEX_ARGS[@]}" ;;
+    claude) herdr agent start "$s-$TAG" --kind claude --pane "$pane" -- "${CLAUDE_ARGS[@]}" ;;
+    *)      echo "the CLI ${CLI_OF[$s]} of slot $s has no parameter set registered in this loop: measure it against that CLI's --help, add a case (do not reuse the values above), then launch"; exit 1 ;;
   esac
 done
 # With the default roster this expands to exactly:
-#   herdr agent start "orch-$TAG" --kind kimi  --pane "$PANE_ORCH" --
-#   herdr agent start "rev-$TAG"  --kind codex --pane "$PANE_REV"  -- -m gpt-6.1-sol -c model_reasoning_effort=high "${CODEX_ARGS[@]}"
-#   herdr agent start "exec-$TAG" --kind claude --pane "$PANE_EXEC" -- "${CLAUDE_ARGS[@]}"
+#   herdr agent start "orch-$TAG" --kind kimi  --pane "${PANE_OF[orch]}" --
+#   herdr agent start "rev-$TAG"  --kind codex --pane "${PANE_OF[rev]}"  -- -m gpt-6.1-sol -c model_reasoning_effort=high
+#   herdr agent start "exec-$TAG" --kind claude --pane "${PANE_OF[exec]}" -- "${CLAUDE_ARGS[@]}"
 # Array elements become separate argv items one by one; a path containing spaces is not split and an empty array produces no
 # argument. Do not fall back to string concatenation (see the measurement in "Mode selection")
 # The model slug and the reasoning level must be passed separately: the slug carries no level, and the level uses its own config
@@ -455,7 +553,8 @@ done
 
 # 4) Rename all N panes (mandatory; skipping it leaves the agent name and the display label inconsistent); the pane label and the agent name are two objects
 for s in $SLOTS; do
-  eval "pane=\$PANE_$(echo $s | tr a-z A-Z)"
+  pane=${PANE_OF[$s]}
+  [ -n "$pane" ] || { echo "slot $s has no pane (the split-pane loop never assigned it): stop for manual confirmation"; exit 1; }
   herdr pane rename "$pane" "$s-$TAG"
 done
 
@@ -514,7 +613,7 @@ The layout is always: the orch position on the left (main tree); non-orch member
 - **Status semantics are unified throughout the document** (Step 0, Step 3 and the restart checkpoint use one set): **able to receive a new ticket = `idle` or `done`** (herdr's done is equally input-ready); `working` is never a criterion, only a supporting observation; `blocked` is a troubleshooting branch. **Members without hooks (such as genox) do not have this set of status semantics**, and use "no active output in pane read + the previous ticket's ACK already on disk" as the receiving condition, see "Backend profiles";
 - Only a ready return from `agent start` counts; if it will not start, `herdr pane read` first to see where it is stuck (codex often sticks on an upgrade prompt — press Esc); **distinguish two kinds of launch failure**: parameter validation failure with no process created → fix the parameters and resend on the same shell pane; process alive but blocked/not-ready → troubleshoot first or wait for it to exit, never resend blindly;
 - If the pane split succeeded but `agent start` failed (e.g. invalid_agent_name, in which case no process was created): the pane need not be rebuilt; fix the parameters and resend `agent start` on the same pane;
-- Acceptance: `herdr pane read` each slot's pane; the review slot's status bar must show both `<model> <reasoning level>` segments, **then send one trivial test message to confirm no 400** before it counts as genuinely usable (looking at the displayed model name alone does not count); the execution slot must show bypass permissions on (unattended parameter set only) — **this only proves the permission mode, not that the deny list is mounted**. List acceptance has two layers: the file existing and valid JSON is a **syntax check** (`python3 -c "import json;json.load(open('...'))"` verifies it in one line); the **effect check** is the orchestrator using `herdr pane read` or having that agent run `/status` (`/permissions`) and looking at the **settings sources and the effective rule list**, pasting the effective rule entries onto the board as evidence — a syntax check is not an effect check, they are two different things. If no effective rules can be verified or the list has not taken effect → **pause dispatching**: stop the already-running execution slot (exit/kill) and relaunch it with the attended set (explicit `--permission-mode default`), then re-verify mode and rules after the relaunch, and only resume dispatching once verified — changing a shell variable or writing a note on the board cannot touch the old process and does not count as a downgrade;
+- Acceptance: `herdr pane read` each slot's pane; the review slot's status bar must show both `<model> <reasoning level>` segments, **then send one trivial test message to confirm no 400** before it counts as genuinely usable (looking at the displayed model name alone does not count); **claude-family** execution slots must show bypass permissions on (unattended parameter set only; other CLIs' unattended sets are the explicit parameter sets in their own profiles — "bypass" is claude's word, do not apply it to other backends) — **this only proves the permission mode, not that the deny list is mounted**. For **claude-family slots**, deny-list acceptance has two layers: the file existing and valid JSON is a **syntax check** (`python3 -c "import json;json.load(open('...'))"` verifies it in one line); the **effect check** is the orchestrator using `herdr pane read` or having that agent run `/status` (`/permissions`) and looking at the **settings sources and the effective rule list**, pasting the effective rule entries onto the board as evidence — a syntax check is not an effect check, they are two different things. For a **claude-family slot**, if no effective rules can be verified or the list has not taken effect → **pause dispatching**: stop that slot (exit/kill) and relaunch it with the attended set (explicit `--permission-mode default`), then re-verify mode and rules after the relaunch, and only resume dispatching once verified — changing a shell variable or writing a note on the board cannot touch the old process and does not count as a downgrade; for non-claude-family slots, verify the mode against the explicit parameters in their own profiles and what is actually displayed (e.g. codex's `-a on-request -c approvals_reviewer=user`), and stop if it cannot be verified;
 - The completion criterion for bootstrap is **the ACK being byte-identical to `/tmp/$TAG/ack-expected` (`cmp -s`; contents = bootstrap ID, tag and the N member full names, N+2 lines)** — contradictory fields, duplicate fields, extra lines, missing lines and trailing spaces are all rejected, and it is not some status observation nor an existence grep: `agent get` is only a supporting observation — a short bootstrap is usually already idle/done by the time `--wait` returns, and waiting for `working` never arrives (an older version made working a hard condition, judged wrong on 2026-10-09); once the ACK is complete, tell the user to switch to the new tab and hand the task to the orch-slot member (that member is the subsequent orchestrator; this launching session only does the setup);
 - Exception (**precondition: mode selection has passed; or a documented authorization was made per "Mode selection" — the user writing the authorized automatic-execution scope into `/tmp/$TAG/mode-selection.md`**; `--auto` = Never Ask, being present ≠ the user approving): if the user loaded this skill inside some kimi --auto session and wants that session itself to be the orchestrator, then do not create a new tab — **first register the agent identity with `herdr agent rename "$HERDR_PANE_ID" "orch-$TAG"`** (renaming a pane/tab is only a display label and is a different object from the agent name; changing the label alone does not register this session under a role name), then take the current pane as P0, split the remaining slots per the worktree/cwd rules above, start the remaining agents, and rename all panes as usual, **and also `herdr tab rename` the tab to the task name** (when that tab also holds unrelated panes, append `<TAG>` to the original name instead). This exception does not exempt mode selection: if the three gates fail and there is no documented authorization above, **disable the exception and stop work** (see "Mode selection"); rename only registers agent identity, does not change this session's CLI permission mode, and does not constitute user approval.
 
@@ -531,7 +630,7 @@ The layout is always: the orch position on the left (main tree); non-orch member
 | exec | claude | codex → copilot → opencode (install the hook first) → genox (attended set only) |
 
 - **Hard constraint: rev-capability members and exec-capability members must not be same-origin** — a same-origin blind spot means a review by one of the other is no review at all. Same-origin judgement is in the pairwise constraint under "Slots and roster declaration" (different CLI and different model family);
-- **Assemble by enumeration, not greedily**: give the candidate pool for each slot to be filled, enumerate **all combinations**, and take the first complete assignment satisfying [capability coverage + pairwise constraint + two-level health check + not the same live agent]. Keep the existing counter-example lesson: "fixed first choice + greedy fallback down the list" stays banned — with only codex and kimi available, the legal solution is **kimi reviews + codex executes**; a greedy rule of "review has a fixed first choice, only step the execution choice down the list" would wrongly report no solution;
+- **Assemble by enumeration, not greedily**: give the candidate pool for each slot to be filled, enumerate **all combinations**, and take the first complete assignment satisfying [capability coverage + pairwise constraint + two-level health check + not the same live agent]. **The two-level health check branches by backend**: for a backend whose profile declares it **has** a status hook, check ① `command -v <cli>` binary and ② `herdr integration status` showing `current`; for a backend whose profile declares **no** hook (genox, see "Backend profiles"), ② is not required — check "that slot's pane is present, a process is alive inside it, and the on-disk ACK identity holds" instead, and **never call a genox slot unsolvable just because it lacks an integration**. Keep the existing counter-example lesson: "fixed first choice + greedy fallback down the list" stays banned — with only codex and kimi available, the legal solution is **kimi reviews + codex executes**; a greedy rule of "review has a fixed first choice, only step the execution choice down the list" would wrongly report no solution;
 - Candidate health checks are at the same level as for a primary backend (binary + integration `current` + account/model availability); if enumeration still yields no legal team, **report clearly that the team cannot be assembled and stop; do not force one**;
 - **Role names are unchanged, and they are slot names, not backend names**: `rev-<tag>`/`exec-<tag>` are slot names (protocol, taskboard and communication all unchanged), while the actual backend and kind are written into the board header; `--kind` takes the actual backend (the list herdr supports follows `herdr agent start --help`);
 - Substitute CLIs have different no-confirmation parameters, so verify the mode after launch: generalized to **verify per CLI against its backend profile** (see "Backend profiles": one entry per CLI with the two-level health check, parameter sets, deny-mount capability and whether a status hook exists);
@@ -551,7 +650,7 @@ The layout is always: the orch position on the left (main tree); non-orch member
 8. A pre-registered number (write the expectation down before running) beats a post-hoc explanation;
 9. **The composite slot `revtest` and the invalidity of self-review (taskboard routing)**: for a ticket the revtest member produced itself, **the review-signature column stays empty**, and the orch moves it straight to "accepted" after its own final verdict, annotating that line "**self-review invalid, orch final verdict**" — the single-writer rule is unchanged and the right to move columns stays with the orch alone.
 
-**The "launch information" section in the board header (the roster table)**: besides the 8 rules above, the board header carries a roster table recording, per slot: slot / agent full name / backend CLI / provider+model / reasoning level / worktree path / parameter set (unattended or attended) — this is the single quick-reference table for re-entry, troubleshooting and "who is doing what".
+**The "launch information" section in the board header (the roster table)**: besides the 9 rules above, the board header carries a roster table recording, per slot: slot / agent full name / backend CLI / provider+model / reasoning level / worktree path / parameter set (unattended or attended) — this is the single quick-reference table for re-entry, troubleshooting and "who is doing what".
 
 ## Unattended mode (pre-authorization for fully automatic collaboration)
 
@@ -579,7 +678,7 @@ All three are **pre-work checks**, not after-the-fact explanations; if unverifie
 
 1. **The push ban is not a hard block**: `Bash(git push ...)` in `claude-exec-deny.json` is only a **textual prefix rule**, a soft defence that equivalent spellings can bypass; the bypass forms are distinguished by method (not lumped together as "measured") — `git push origin HEAD:main` (the local bare remote's main is actually rewritten) and `git push origin --force` are **real Git executions**, evidence `/tmp/skill-review/evidence.json`; `git push upstream main`, `+refspec` force-pushes, the `git -C <dir> push ...` wrapper and bare `git push` (which depends on upstream/refspec config) are only **text modelling of the prefix rule** (the command string compared against the rule list, with no real Git execution recorded); none of these forms is **measured inside the Claude permission engine**. `--force`, `-f` and `--force-with-lease` are three independent prefixes, and the list is incomplete. A genuine permanent ban can only come from **remote branch protection / restricted credentials / a controlled push entry point**, enforced on the parsed target ref and force semantics;
 2. **Secret reading is covered only for direct reads inside cwd**: the `Read(./**/...)` rules cannot reach `~/.ssh/` or CLI credential directories, and cannot stop **indirect reads**: a subprocess (Python/Node) opening a file itself, or a search that names no file explicitly. Dangerous forms go into deny by **enumeration** (`.env.local`/`.env.production`/`.env.development`/`.env.staging`, `credentials.json`, `*.key`, `id_rsa`, etc.), which is why template names (`.env.example`/`.env.sample`/`.env.template`) are naturally not matched — permissions are evaluated deny → ask → allow, and **a broad deny beats a narrow allow, so do not count on a whitelist exemption**; enumeration is inherently incomplete, so an unattended environment **should not mount unnecessary credentials**; the read boundary must be enforced by process-level file permissions/a sandbox, and no configuration can claim to have enumerated "all secrets";
-3. **A worktree is not a security boundary**: it isolates only working files and the index, while **git metadata (config/refs under the common dir) is shared with the main tree** — measured: the execution line reading `git config` sees the main tree's, `git update-ref refs/heads/main` can change the main tree's main ref, and it can push the local remote's main. So "only the orchestrator may touch the main tree" is a **disciplinary agreement that does not hold mechanically**; a hard boundary requires a process-level sandbox/container + a separate Unix user + restricted remote credentials, enabled after the user explicitly chooses that authorized scope;
+3. **A worktree is not a security boundary**: it isolates only working files and the index, while **git metadata (config/refs under the common dir) is shared with the main tree** — it was measured that the execution line's `git config` is read by the main tree, that `git update-ref refs/heads/main` can change the main tree's main ref, and that it can push to a local remote's main. So "only the orchestrator may touch the main tree" is a **disciplinary agreement that does not hold mechanically**; a hard boundary requires a process-level sandbox/container + a separate Unix user + restricted remote credentials, enabled after the user explicitly chooses that authorized scope;
 4. **Substitute backends have no equivalent controls**: when claude is absent, `--settings` mounting is unavailable and substitute CLIs have no equivalent deny mechanism; that slot's unattended capability should then be disabled or switched to attended (see the last item of "Team assembly and substitutes");
 5. **`/tmp` may be cleaned by the system**: the taskboard, ACKs and verdicts all live in `/tmp/<TAG>/`, and a reboot or a cleanup service will delete them; the key manifest, the final verdict and the recovery pointer must be saved elsewhere in a durable location inside the project (see item 1 of "Context/token discipline");
 6. **A heartbeat cron belongs to its session**: scheduled tasks belong to the current session and are not inherited by a new session, so they must be recreated (see the last item of Step 3);
@@ -599,6 +698,7 @@ Until the hard boundaries behind items 1–3 above (remote protection, credentia
 | codex | `--approve-for-me` | **explicit** `-a on-request -c approvals_reviewer=user` (inheritance is not accepted: omitting the flag ≠ human approval — this machine's user config is measured as `approval_policy = "never"`; the approver is separately determined by `approvals_reviewer`, so **on-request does not mean every command asks a human**) | none | yes |
 | claude | `--dangerously-skip-permissions --settings ${KIMI_SKILL_DIR}/claude-exec-deny.json` | **explicit** `--permission-mode default` + `--settings` (deny only tightens, never loosens); from ≥2.1.283, not passing bypass may still inherit auto or the user's `permissions.defaultMode`, so **inheritance is not accepted**; verify the real mode after launch | **yes** (claude family only) | yes |
 | ↑ note | when the roster contains **several claude-family slots** (e.g. `exec=claude` + `exec2=claude`), **every instance mounts the same `--settings` deny list**: the list is **mounted per instance**, not "bound to one particular slot" — the existing conclusion that it "binds only the `exec` slot and does not affect a user's own separately launched claude" is precisely the proof of per-instance mounting; when adding a claude-family slot, the launch loop still carries `--settings`, and none is left out | | | |
+| ↑ note (codex) | **Network egress (limited to the author's environment, not a general fact)**: in the author's environment codex goes through a VPN while kimi/deepseek do not — so when only codex drops, check the VPN first; each person troubleshoots by analogy with their own egress situation (Step 3's re-delivery criterion uses this note) | | | |
 | copilot / opencode / others | follow that CLI's `--help` as measured (**verify per CLI**, do not copy the values above) | same as left, explicit manual mode | none | present after `herdr integration install <agent>` |
 | **genox** | **none** (see below) | interactive `genox chat` (the attended set is its only usable set) | **none** | **none** (herdr has no genox kind/integration) |
 
