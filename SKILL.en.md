@@ -241,9 +241,9 @@ declare -A EXPECT_OF                                    # slot → expected cwd:
 NO_HOOK_CLI="genox"                                     # backends whose profile declares "no status hook": not in the herdr agent registry (see "Backend profiles")
 HOOKLESS=""
 for s in $SLOTS; do
-  case " $NO_HOOK_CLI " in *" ${CLI_OF[$s]} "*) HOOKLESS="$HOOKLESS $s";; esac
+  case " $NO_HOOK_CLI " in *" ${CLI_OF[$s]} "*) HOOKLESS="$HOOKLESS $s=${CLI_OF[$s]}";; esac
 done
-HOOKLESS=${HOOKLESS# }                                  # hookless slots (fixed slot order): the reuse check branches on this
+HOOKLESS=${HOOKLESS# }                                  # hookless slots (fixed slot order), each recorded as <slot>=<cli>: the reuse check needs that slot's CLI name to match the pane's foreground process name, so the slot name alone is not enough
 # The path plan is fixed before the manifest is generated (not "compute sibling worktrees first, then reject the non-git fallback
 # the document allows"):
 #   git repo → the orch slot's cwd = the main tree, and every non-orch slot gets a sibling worktree; non-git → all N cwds record
@@ -383,7 +383,7 @@ fi
 # both sides are compared after realpath normalization — a path with `..` and a canonical cwd that point at the same directory
 # must compare equal, or a normal re-entry would be misjudged;
 # a missing tab_id/workspace_id exits non-zero (fail-closed); "it printed a conclusion" is not a pass
-# Hookless slots ($HOOKLESS — profiles that declare they are not in the herdr registry, e.g. genox) are exempt from the
+# Hookless slots ($HOOKLESS, each item <slot>=<cli>; profiles that declare they are not in the herdr registry, e.g. genox) are exempt from the
 # agent-list existence check and are verified three ways instead:
 #   ① pane identity: the pane recorded in panes.txt is still present, label == <slot>-<tag>, same tab, cwd as expected;
 #   ② pane process alive: the foreground process is non-empty and its name == the CLI declared for that slot (absent = missing, refill that one slot);
@@ -392,7 +392,8 @@ fi
 # asserts "slot count == path count, non-empty, unique" and only then compares.
 herdr agent list > "$TD/agent-list.json"
 herdr pane list  > "$TD/pane-list.json"
-for s in $HOOKLESS; do
+for _hs in $HOOKLESS; do
+  s=${_hs%%=*}                                          # each $HOOKLESS item is <slot>=<cli>: take the slot name to look up panes.txt and to name the pane-info file
   p=$( [ -s "$TD/panes.txt" ] && awk -v s="$s" '$1 == s {print $2}' "$TD/panes.txt" )
   [ -n "$p" ] || continue                               # no pane record → let the parser report it as a missing member (a fresh launch has no panes yet)
   herdr pane process-info --pane "$p" > "$TD/pane-info-$s.json" \

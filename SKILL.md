@@ -232,9 +232,9 @@ declare -A EXPECT_OF                                    # 槽位 → 预期 cwd:
 NO_HOOK_CLI="genox"                                     # 档案声明"无状态钩子"的后端:不进 herdr agent 注册表(见"后端档案")
 HOOKLESS=""
 for s in $SLOTS; do
-  case " $NO_HOOK_CLI " in *" ${CLI_OF[$s]} "*) HOOKLESS="$HOOKLESS $s";; esac
+  case " $NO_HOOK_CLI " in *" ${CLI_OF[$s]} "*) HOOKLESS="$HOOKLESS $s=${CLI_OF[$s]}";; esac
 done
-HOOKLESS=${HOOKLESS# }                                  # 无钩子槽位(槽位固定序):复用检查据此分流
+HOOKLESS=${HOOKLESS# }                                  # 无钩子槽位(槽位固定序),每项记成 <slot>=<cli>:复用检查要拿该槽位的 CLI 名核对 pane 前台进程名,只记槽位名不够
 # 路径方案在生成 manifest 之前定死(不是先算兄弟 worktree、再拒正文允许的非 git 降级):
 #   git 仓库 → orch 槽位 cwd = 主树,每个非 orch 槽位各一条兄弟 worktree;非 git → 全部 N 个 cwd 都记主树(只允许在有人在场模式下)
 if git -C "$PWD" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
@@ -365,14 +365,15 @@ fi
 # (不是要求各槽位 cwd 相等——同 tab 但错跑到别的目录,一样不能复用);
 # 两侧都过 realpath 规范化后比较——带 .. 的拼法与规范 cwd 指向同一目录时必须判等,否则正常重入会被误判;
 # tab_id/workspace_id 任一缺失即非零退出(fail-closed),不拿"能打印出结论"当通过
-# 无钩子槽位($HOOKLESS,档案声明不进 herdr 注册表,如 genox)豁免 agent-list 存在性,改验三件:
+# 无钩子槽位($HOOKLESS,每项 <slot>=<cli>;档案声明不进 herdr 注册表,如 genox)豁免 agent-list 存在性,改验三件:
 #   ① pane 身份:panes.txt 记的 pane 仍在,label == <slot>-<tag>,同 tab,cwd 与预期一致;
 #   ② pane 进程存活:前台进程非空,且进程名 == 该槽位声明的 CLI(不在 = 缺,只补这一格);
 #   ③ 落盘 ACK 身份:bootstrap-ack.md 与本次 ack-expected 全文全等(不是本任务的 ACK 不认,防跨任务复用)
 # 预期路径用**引用的 bash 数组**逐项成 argv 传(含空格的路径不被拆);解析器先断言"槽位数 == 路径数、非空、唯一"再比对。
 herdr agent list > "$TD/agent-list.json"
 herdr pane list  > "$TD/pane-list.json"
-for s in $HOOKLESS; do
+for _hs in $HOOKLESS; do
+  s=${_hs%%=*}                                          # $HOOKLESS 每项是 <slot>=<cli>:取槽位名去查 panes.txt 与落 pane-info
   p=$( [ -s "$TD/panes.txt" ] && awk -v s="$s" '$1 == s {print $2}' "$TD/panes.txt" )
   [ -n "$p" ] || continue                               # 没有 pane 记录 → 交给解析器按"缺成员"报(新建时本来就没有 pane)
   herdr pane process-info --pane "$p" > "$TD/pane-info-$s.json" \
