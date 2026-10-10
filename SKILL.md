@@ -118,26 +118,40 @@ ROSTER=$roster                     # 第二参数;为空 → 用默认声明(见
 # 该正则拒空成员(`+`连写)、拒空段(`=`后无值)、拒 `::`、拒大写与空格与换行;每成员最多 4 段(slot=cli:model:effort:family)
 
 # ── roster 结构校验(解析后,python 一步做完,失败即停)────────────────────
-# 依次:① 槽位名 ∈ 词表、同 roster 内不重复;② N ≥ 2;③ 能力覆盖 orch≥1/rev≥1/exec≥1;
-# ④ 单编排(orch 恰好 1);⑤ 成对约束枚举(rev 能力 × exec 能力,不得同源);⑥ 每成员全名 ^[a-z0-9_-]{1,32}$ 且 ≤32;
-# ⑦ cli ∈ 本机后端档案表(见"后端档案";未知 CLI → "无档案,先补后端档案再拉起")。
+# 依次:① 槽位名 ∈ 词表、同 roster 内不重复、段数 ≤5 且无空段;② N ≥ 2;③ 能力覆盖 orch≥1/rev≥1/exec≥1;
+# ④ 单编排(orch 恰好 1)且 orch 的 CLI 必须是 kimi(技能就跑在 kimi 里;genox 等无钩子后端不得承担 orch);
+# ⑤ 成对约束枚举(rev 能力 × exec 能力,不得同源);⑥ 每成员全名 ^[a-z0-9_-]{1,32}$ 且 ≤32;
+# ⑦ cli ∈ 本机后端档案表(见"后端档案";未知 CLI → "无档案,先补后端档案再拉起");
+# ⑧ 声明的 model/effort 必须在该 CLI 的档案里有对应启动 flag(没 flag 的字段点名拒绝,不静默丢弃——"后端档案"参数合成表)。
 # 校验通过后输出规范化 roster 串(槽位序固定:orch 恒第一,其余按声明序),写进 manifest 的 roster: 行与 bootstrap,
 # 保证重入时预期集合可重建。
-ROSTER_NORM=$(python3 - "$ROSTER" "$TAG" <<'PY'
+# 本段是**唯一一份** roster 校验/规范化源码(下称 DSL):除本次入参外,重入时从 manifest 读回的 roster: 行
+# 也由同一份源码复验并比全值(后端/模型/推理档/family),两边规则不会各自漂移。
+ROSTER_DSL=$(cat <<'PY'
 import re, sys
 CAPS = {"orch": {"orch"}, "rev": {"rev"}, "rev2": {"rev"}, "revtest": {"rev", "exec"}, "exec": {"exec"}}
 for _i in range(2, 10):
     CAPS[f"exec{_i}"] = {"exec"}                       # exec2…exec9 十个扩展执行线
 KNOWN_CLI = {"kimi", "codex", "claude", "copilot", "opencode", "genox"}   # 本机后端档案表;扩充档案时同步这里
+CLI_FIELDS = {                                          # 各 CLI 档案里**有**对应启动 flag 的字段(实测,见"后端档案"参数合成表):
+    "kimi": {"model"},                                  # 没列出的字段=该后端不支持,声明即拒,不静默丢弃
+    "codex": {"model", "effort"},                       # codex: -m <model> -c model_reasoning_effort=<effort>
+    "claude": {"model", "effort"},                      # claude: --model <model> --effort <level>
+}
 roster, tag = sys.argv[1], sys.argv[2]
 full = re.compile(r"^[a-z0-9_-]{1,32}$")
 members = []
 for part in roster.split("+"):
     seg = part.replace("=", ":", 1).split(":")      # 先拆一次 `=`(seg[0] 里装的是 `slot=cli` 整串,不是 slot),再按 `:` 分段
+    if len(seg) > 5:                                # 段数上限 slot=cli:model:effort:family;多出的段非法,不静默丢弃
+        sys.exit(f"成员段数越界:{part!r}(最多 slot=cli:model:effort:family 五段)")
     slot, cli = seg[0], seg[1]
     model = seg[2] if len(seg) > 2 else ""
     effort = seg[3] if len(seg) > 3 else ""
     family = seg[4] if len(seg) > 4 else model      # family 缺省 = model 原串
+    for _x in seg[2:]:                              # 空段(如 `::`、尾随 `:`)是非法声明,不当"未声明该字段"放过
+        if not _x:
+            sys.exit(f"成员段为空:{part!r}(空段非法;不声明就整段不写)")
     if slot not in CAPS:                            # 未知槽位:点名拒绝(中文报错,不让 KeyError 栈回溯冒出来)
         sys.exit(f"未知槽位名 {slot!r}:槽位取自封闭词表 orch/rev/rev2/revtest/exec/exec2…exec9")
     members.append(dict(slot=slot, cli=cli, model=model, effort=effort, family=family, caps=CAPS[slot]))
@@ -152,9 +166,12 @@ if len(members) < 2:
 for cap in ("orch", "rev", "exec"):
     if not any(cap in m["caps"] for m in members):
         sys.exit(f"编队缺少 {cap} 能力:每个 roster 必须有 orch ≥1、rev ≥1、exec ≥1")
-# ④ 单编排
-if sum(1 for m in members if "orch" in m["caps"]) != 1:
+# ④ 单编排 + orch 后端限制
+_oslots = [m for m in members if "orch" in m["caps"]]
+if len(_oslots) != 1:
     sys.exit("必须单编排:orch 槽位恰好一个")
+if _oslots[0]["cli"] != "kimi":
+    sys.exit(f"orch 槽位的 CLI 必须是 kimi(实得 {_oslots[0]['cli']}):技能就跑在 kimi 里,无钩子后端不得承担 orch(见\"组队与替补\")")
 # ⑤ 成对约束:rev 能力 × exec 能力 不得同源(复合槽位自配对跳过,走"自审无效"条款)
 revs = [m for m in members if "rev" in m["caps"]]
 execs = [m for m in members if "exec" in m["caps"]]
@@ -177,6 +194,13 @@ for m in members:
 for m in members:
     if m["cli"] not in KNOWN_CLI:
         sys.exit(f"CLI {m['cli']} 无档案,先补后端档案再拉起")
+# ⑧ 逐槽位字段能力:后端档案没有对应 flag 的字段,声明即拒(不静默忽略)
+for m in members:
+    _allow = CLI_FIELDS.get(m["cli"], set())
+    for _f in ("model", "effort"):
+        if m[_f] and _f not in _allow:
+            sys.exit(f"槽位 {m['slot']}({m['cli']})不支持 {_f} 声明 {m[_f]!r}:该后端档案里没有对应启动参数,"
+                     f"声明即拒、不静默丢弃(见\"后端档案\"参数合成表);删掉该字段或换后端")
 order = {"orch": 0}
 members.sort(key=lambda m: (order.get(m["slot"], 1), slots.index(m["slot"])))
 out = []
@@ -191,7 +215,10 @@ for m in members:
     out.append(":".join(seg))
 print("+".join(out))                                # stdout 只出一行规范化 roster 串
 PY
+)
+ROSTER_NORM=$(python3 -c "$ROSTER_DSL" "$ROSTER" "$TAG"
 ) || { echo "roster 结构校验不过:停下,按上面报错整改后再拉起"; exit 1; }
+export ROSTER_DSL ROSTER_NORM                       # 校验器源码与规范 roster 随环境传给后面的解析器(manifest 的 roster 行由同一份源码复验)
 echo "规范化 roster:$ROSTER_NORM"
 
 # ── 任务目录:先分类后取锁、先定路径方案;不无条件覆盖 ──────────────────────
@@ -204,15 +231,26 @@ echo "规范化 roster:$ROSTER_NORM"
 TD="/tmp/$TAG"                                          # 任务目录(状态目录);本块一律用 $TD
 mkdir -p "$TD"                                          # 幂等
 
-# 目录/文件安全:读写的每个路径都查——不是符号链接(`[ -L ]`)、属主是自己;不存在的视为可创建
+# 目录/文件安全:读写的每个路径都查——不是符号链接(`[ -L ]`)、属主是自己;不存在的视为可创建;
+# 规范化后还必须落在任务目录里(跨出边界的路径先拒,写之前就停)
 guard() {
   [ -e "$1" ] || [ -L "$1" ] || return 0
   [ -L "$1" ] && { echo "拒绝:$1 是符号链接(可能指向任务目录外部)"; return 1; }
   [ "$(stat -c %u -- "$1" 2>/dev/null)" = "$(id -u)" ] || { echo "拒绝:$1 属主不是当前用户"; return 1; }
   return 0
 }
-for p in "$TD" "$TD/manifest.txt" "$TD/taskboard.md" "$TD/bootstrap.md" "$TD/bootstrap-ack.md" "$TD/ack-expected" "$TD/mode-selection.md" "$TD/panes.txt"; do
-  guard "$p" || { echo "任务目录/文件安全核验不过:停下人工确认"; exit 1; }
+TD_REAL=$(realpath -m "$TD")
+guard_td() {                                            # guard + 任务目录边界:规范化后必须等于 $TD 或在其下
+  guard "$1" || return 1
+  case "$(realpath -m "$1")" in
+    "$TD_REAL"|"$TD_REAL"/*) return 0 ;;
+    *) echo "拒绝:$1 规范化后不在任务目录 $TD_REAL 内"; return 1 ;;
+  esac
+}
+# 静态清单含本次新增的落盘 JSON 快照(agent-list / pane-list)与缺失清单(missing-slots.txt):它们也要拒符号链接、
+# 核属主、核边界,不能因为"是 herdr 输出重定向"或"是复用检查自己写的"就跳过(2026-10-10 复审:链接穿透会把任务目录外的文件覆盖掉)
+for p in "$TD" "$TD/manifest.txt" "$TD/taskboard.md" "$TD/bootstrap.md" "$TD/bootstrap-ack.md" "$TD/ack-expected" "$TD/mode-selection.md" "$TD/panes.txt" "$TD/agent-list.json" "$TD/pane-list.json" "$TD/missing-slots.txt"; do
+  guard_td "$p" || { echo "任务目录/文件安全核验不过:停下人工确认"; exit 1; }
 done
 
 ROOT=$(realpath -m "$PWD")                              # 项目根规范绝对路径:任务身份的锚
@@ -221,11 +259,14 @@ SLOTS=$(python3 -c 'import sys;print(" ".join(p.split("=")[0].split(":")[0] for 
 N=$(echo $SLOTS | wc -w)
 SLOT_ARR=($SLOTS)                                       # 槽位固定序,可按下标取(槽位名只含 [a-z0-9_],分词安全)
 declare -A CLI_OF                                       # 槽位 → 后端 CLI:起代理循环按 CLI 分流(无钩子后端走 pane 直起)
-while read -r _s _c; do CLI_OF[$_s]=$_c; done < <(python3 - "$ROSTER_NORM" <<'PY'
+declare -A MODEL_OF EFFORT_OF                           # 槽位 → 声明的模型 / 推理档:逐槽位 argv 从这两张表合成(不再按 CLI 共用一套)
+while read -r _s _c _m _e; do CLI_OF[$_s]=$_c; MODEL_OF[$_s]=$_m; EFFORT_OF[$_s]=$_e; done < <(python3 - "$ROSTER_NORM" <<'PY'
 import sys
 for part in sys.argv[1].split("+"):
     seg = part.replace("=", ":", 1).split(":")
-    print(seg[0], seg[1])
+    model = seg[2] if len(seg) > 2 else ""
+    effort = seg[3] if len(seg) > 3 else ""
+    print(seg[0], seg[1], model, effort)
 PY
 )
 declare -A EXPECT_OF                                    # 槽位 → 预期 cwd:新建/重入两条路都必须填满,复用检查与裂 pane 一律从这里取
@@ -235,24 +276,23 @@ for s in $SLOTS; do
   case " $NO_HOOK_CLI " in *" ${CLI_OF[$s]} "*) HOOKLESS="$HOOKLESS $s=${CLI_OF[$s]}";; esac
 done
 HOOKLESS=${HOOKLESS# }                                  # 无钩子槽位(槽位固定序),每项记成 <slot>=<cli>:复用检查要拿该槽位的 CLI 名核对 pane 前台进程名,只记槽位名不够
-# 路径方案在生成 manifest 之前定死(不是先算兄弟 worktree、再拒正文允许的非 git 降级):
-#   git 仓库 → orch 槽位 cwd = 主树,每个非 orch 槽位各一条兄弟 worktree;非 git → 全部 N 个 cwd 都记主树(只允许在有人在场模式下)
-if git -C "$PWD" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
-  PATH_PLAN=worktree
-else
-  PATH_PLAN=main-only
-fi
-# 逐槽位预期路径:git 方案下 orch=主树、其余 ../wt-$TAG-<slot>;非 git 方案下全部=主树
+# 无钩子槽位的 pane 证据 JSON(pane-info-<slot>.json)名字随槽位变:逐个补进安全核验(同样写盘前先拒)
+for _hs in $HOOKLESS; do
+  guard_td "$TD/pane-info-${_hs%%=*}.json" || { echo "任务目录/文件安全核验不过(无钩子槽位 pane 证据):停下人工确认"; exit 1; }
+done
+
+# 路径方案先只备两个候选公式(都是 $PWD/$TAG/槽位名的纯函数,不查 git):worktree 方案下 orch=主树、
+# 其余 ../wt-$TAG-<slot>;main-only 方案下全部=主树。**用哪个方案只在"新建"分支里按当时 git 状态定死**;
+# 重入一律从冻结 manifest 恢复,不看当前 git 状态(先分类、后算路径)
 EXPECT_MAIN=$(realpath -m "$PWD")
-expect_of() {                                            # $1 = slot
-  if [ "$PATH_PLAN" = worktree ] && [ "$1" != orch ]; then
-    realpath -m "$PWD/../wt-$TAG-$1"
-  else
-    echo "$EXPECT_MAIN"
-  fi
+expect_wt_of() {                                        # worktree 方案:orch 槽位在主树,其余在兄弟 worktree
+  if [ "$1" = orch ]; then echo "$EXPECT_MAIN"; else realpath -m "$PWD/../wt-$TAG-$1"; fi
+}
+expect_of() {                                           # 按已定/已恢复的 $PATH_PLAN 取该槽位预期路径
+  if [ "$PATH_PLAN" = worktree ]; then expect_wt_of "$1"; else echo "$EXPECT_MAIN"; fi
 }
 
-# ① 分类:只读判断,先不写任何东西
+# ① 分类:只读判断,先不写任何东西(先分类后算路径:main-only 建好之后再 git init,重入仍按 main-only)
 if [ -s "$TD/manifest.txt" ]; then
   CLASSIFY=reentry
 elif [ -n "$(ls -A "$TD" 2>/dev/null)" ]; then
@@ -267,23 +307,51 @@ mkdir "$TD/launch.lock" 2>/dev/null || { echo "已有拉起流程在跑(launch.l
 if [ "$CLASSIFY" = reentry ]; then
   # 重入:manifest **唯一解析**——必需字段(tag / roster / project-root / created / bootstrap-id)
   # 每条恰好一行、值非空;同名字段出现两次即拒(矛盾值不算"逐字段一致");
-  # cwd 行数 == N、cwd 槽位集合 == roster 行的槽位集合、逐槽位 realpath 比对。
-  # N 从 roster 行读出(不用 shell 二次解析);预期路径由本进程按 path plan 逐槽位算出后传入,
-  # 两侧都过 realpath 规范化再比。stdout 只出 N 条已验路径,按槽位固定序,供 shell 逐行取回。
-  _eargs=()                                             # 槽位/预期路径成对进**引用的数组**:含空格的路径整条是一个 argv,不被拆开
-  for s in $SLOTS; do _eargs+=("$s" "$(expect_of "$s")"); done
-  _mout=$(python3 - "$TAG" "$ROOT" "$TD/manifest.txt" "$SLOTS" "${_eargs[@]}" <<'PY'
-import os, sys
-tag, root, path = sys.argv[1:4]
+  # roster 行先过**同一份 DSL 源码**(与环境里的 ROSTER_DSL/ROSTER_NORM 对表,比的是全值:
+  # 后端/模型/推理档/family 全在内,槽位集合相同但换了后端或模型一样拒);
+  # cwd 行数 == N、cwd 槽位集合 == roster 行的槽位集合、逐槽位 realpath 比对**冻结方案**。
+  # 冻结方案 = 新建时定死的那一个,重入时由 manifest 的 cwd 行集合恢复(worktree / main-only 两个候选
+  # 公式都由 shell 作为**纯函数**传入,不查当前 git 状态):cwd 行必须整套落在其中一个方案里,不重推方案。
+  # stdout 出 N 条已验路径(槽位固定序)+ bootstrap-id 行 + path-plan 行,供 shell 逐行取回。
+  _eargs=()                                             # 方案名与槽位/预期路径成对进**引用的数组**:含空格的路径整条是一个 argv,不被拆开
+  for _pl in worktree main-only; do                     # 两个候选方案各来一组:新建时二选一,重入时按 cwd 行认领
+    _eargs+=("$_pl")
+    for s in $SLOTS; do
+      if [ "$_pl" = worktree ]; then _eargs+=("$s" "$(expect_wt_of "$s")"); else _eargs+=("$s" "$EXPECT_MAIN"); fi
+    done
+  done
+  _mout=$(python3 - "$TAG" "$ROOT" "$TD/manifest.txt" "$SLOTS" "$ROSTER_NORM" "${_eargs[@]}" <<'PY'
+import os, sys, subprocess
+tag, root, path, rnorm = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[5]   # 本次完整规范 roster 是**显式入参**(不再只给槽位表)
 slots = sys.argv[4].split()                             # $SLOTS 传进来是空格分隔的**字符串**:必须 split 成 list,否则 list 比 string 恒不相等
-rest = sys.argv[5:]
+rest = sys.argv[6:]
 if not slots or len(set(slots)) != len(slots):
     sys.exit(f"槽位表非法(为空或有重复):{slots}")
-if len(rest) != 2 * len(slots):
-    sys.exit(f"槽位与预期路径不是成对的 N 组:槽位 {len(slots)} 个、参数 {len(rest)} 项")
-want = dict(zip(rest[0::2], rest[1::2]))
-if set(want) != set(slots) or any(not p for p in want.values()):
-    sys.exit("槽位→预期路径映射不完整或含空值")
+dsl = os.environ.get("ROSTER_DSL", "")
+if not dsl or not rnorm:
+    sys.exit("环境里没有本次的 roster 校验器源码(ROSTER_DSL)/规范 roster 入参:fail-closed,不识别本任务")
+def canon(rs):                                          # 用**同一份** DSL 源码做校验+规范化;不过就停在这一层
+    r = subprocess.run([sys.executable, "-c", dsl, rs, tag], capture_output=True, text=True)
+    if r.returncode != 0:
+        sys.exit("roster 未过 DSL 校验:" + (r.stderr.strip() or r.stdout.strip()))
+    return r.stdout.strip()
+if canon(rnorm) != rnorm:
+    sys.exit("本次规范 roster 入参不是规范形:fail-closed")
+stride = 1 + 2 * len(slots)
+if not rest or len(rest) % stride:
+    sys.exit(f"路径方案组不是整组 N 对:槽位 {len(slots)} 个、参数 {len(rest)} 项")
+groups = {}
+for off in range(0, len(rest), stride):
+    grp = rest[off:off + stride]
+    plan, pairs = grp[0], grp[1:]
+    if plan not in ("worktree", "main-only") or plan in groups:
+        sys.exit(f"路径方案组名非法或重复:{plan!r}")
+    want = dict(zip(pairs[0::2], pairs[1::2]))
+    if set(want) != set(slots) or any(not p for p in want.values()):
+        sys.exit(f"方案 {plan} 的槽位→预期路径映射不完整或含空值")
+    groups[plan] = want
+if set(groups) != {"worktree", "main-only"}:
+    sys.exit(f"缺少路径方案组:实得 {sorted(groups)}")
 seen = {}
 for line in open(path, encoding="utf-8"):
     line = line.rstrip("\n")
@@ -302,12 +370,11 @@ def one(k):                                             # 必需字段恰好一�
     return vs[0]
 if one("tag") != tag: sys.exit("tag 不符")
 if one("project-root") != root: sys.exit("project-root 不符")
-one("created"); one("bootstrap-id")                     # 存在、恰好一行、值非空
+one("created")                                          # 存在、恰好一行、值非空
+task_id = one("bootstrap-id")                           # 任务身份号:重建 ACK 期望的唯一依据
 roster = one("roster")                                  # roster 行:必需、恰好一行、非空
-rslots = [p.split("=")[0].split(":")[0] for p in roster.split("+")]
-if rslots[0] != "orch": sys.exit(f"roster 行槽位序不合法(orch 必须第一):{roster!r}")
-if rslots != slots:
-    sys.exit(f"roster 行槽位集合与本次不符:{rslots} ≠ {slots}")
+if canon(roster) != rnorm:
+    sys.exit(f"manifest 的 roster 行与本次规范 roster 不同:{canon(roster)!r} ≠ {rnorm!r}(换了后端/模型/推理档/family 都算不同)")
 cwds = seen.get("cwd", [])
 if len(cwds) != len(slots):
     sys.exit(f"cwd 行数应 == N = {len(slots)}(实得 {len(cwds)})")
@@ -323,29 +390,57 @@ for v in cwds:
     got[slot] = p.strip()
 if set(got) != set(slots): sys.exit("cwd 槽位集合与 roster 行不符")
 if [k for k in got] != slots: sys.exit("cwd 行序与槽位固定序不符")
-for name in slots:
-    if os.path.realpath(got[name]) != os.path.realpath(want[name]):
-        sys.exit(f"{name} cwd={got[name]} ≠ 预期 {want[name]}(realpath 规范化后仍不同)")
-print("manifest 唯一解析通过:字段无重复、值非空,roster 行与 N 个槽位 cwd 与本次一致", file=sys.stderr)
+def mism(plan):                                         # 该方案下对不上的槽位明细
+    return ", ".join(f"{s} cwd={got[s]} ≠ 方案预期 {groups[plan][s]}"
+                     for s in slots if os.path.realpath(got[s]) != os.path.realpath(groups[plan][s]))
+matched = [pl for pl in ("worktree", "main-only") if not mism(pl)]
+if len(matched) != 1:                                   # 0 个 = 不属任何冻结方案;2 个 = 方案歧义;都 fail-closed
+    sys.exit("cwd 行不落在唯一的冻结路径方案里(" + ("; ".join(mism(pl) for pl in ("worktree", "main-only")) if not matched
+             else "两个方案同时成立,方案歧义") + ")")
+print(f"manifest 唯一解析通过:字段无重复、值非空;roster 行过同一 DSL 且与本次全值一致;cwd 行属冻结方案 {matched[0]}", file=sys.stderr)
 for name in slots:
     print(got[name])                                    # stdout 只出 N 条已验路径(槽位固定序),供 shell 逐行取回
+print("bootstrap-id: " + task_id)                       # 任务身份号:复用检查重建 ACK 期望时用它
+print("path-plan: " + matched[0])                       # 冻结方案:重入不按当前 git 状态重推
 PY
-  ) || { echo "manifest 与本次不符(字段重复/空值/项目根/roster/槽位路径/缺路径):不识别为本任务,停下人工确认"; exit 1; }
-  # 预期 cwd 由上面同一解析器同一套算法验过(重入不重新拼路径方案、也不二次解析——awk 二次解析的字段口径
+  ) || { echo "manifest 与本次不符(字段重复/空值/项目根/roster 全值/冻结方案路径/缺路径):不识别为本任务,停下人工确认"; exit 1; }
+  # 预期 cwd 由上面同一解析器同一套算法验过(重入不按当前 git 状态重拼方案、也不二次解析——awk 二次解析的字段口径
   # 曾与 manifest 行格式脱节,三条 EXPECT 被清空,2026-10-09 N4);逐行取回,r5 同款 IFS= read -r,**禁用 eval**:
   # 路径是数据不是 shell 源码(可含空格、反斜杠、字面 $()),回读只许原样进数组;并防空值、防多行/少行
-  i=0
+  i=0; TASK_ID=""; PLAN_IN=""
   while IFS= read -r _line; do
-    [ -n "$_line" ] || { echo "重入取回的槽位 cwd 为空(第 $((i+1)) 行):停下人工确认"; exit 1; }
-    [ "$i" -lt "$N" ] || { echo "重入取回的路径多于 N=$N 行:停下人工确认"; exit 1; }
-    EXPECT_OF[${SLOT_ARR[$i]}]=$_line                   # 槽位固定序逐行落位(r5 的三个 EXPECT_* 的泛化位)
+    if [ "$i" -lt "$N" ]; then
+      [ -n "$_line" ] || { echo "重入取回的槽位 cwd 为空(第 $((i+1)) 行):停下人工确认"; exit 1; }
+      EXPECT_OF[${SLOT_ARR[$i]}]=$_line                 # 槽位固定序逐行落位(r5 的三个 EXPECT_* 的泛化位)
+    else
+      case "$_line" in
+        "bootstrap-id: "*) [ -z "$TASK_ID" ] || { echo "重入取回出现重复的 bootstrap-id 行:停下人工确认"; exit 1; }
+                           TASK_ID=${_line#bootstrap-id: } ;;
+        "path-plan: "*)    [ -z "$PLAN_IN" ] || { echo "重入取回出现重复的 path-plan 行:停下人工确认"; exit 1; }
+                           PLAN_IN=${_line#path-plan: } ;;
+        *) echo "重入取回出现预期之外的行:$_line(fail-closed)"; exit 1 ;;
+      esac
+    fi
     i=$((i+1))
   done <<< "$_mout"
-  [ "$i" = "$N" ] || { echo "重入取回的路径 $i 行、应 $N 行:停下人工确认"; exit 1; }
-  EXPECT_MAIN=${EXPECT_OF[orch]}                        # orch 槽位 cwd 即主树路径(非 git 方案下全部槽位都是它)
-  echo "重入:manifest 唯一解析一致,复用已有看板,只补缺、不覆盖"
+  [ "$i" = "$((N + 2))" ] || { echo "重入取回 $i 行、应 $((N + 2)) 行(N 条路径 + bootstrap-id + path-plan):停下人工确认"; exit 1; }
+  [ -n "$TASK_ID" ] || { echo "重入取回的 bootstrap-id 为空:fail-closed"; exit 1; }
+  case "$PLAN_IN" in
+    worktree|main-only) PATH_PLAN=$PLAN_IN ;;
+    *) echo "重入取回的路径方案非法:$PLAN_IN(fail-closed)"; exit 1 ;;
+  esac
+  EXPECT_MAIN=${EXPECT_OF[orch]}                        # orch 槽位 cwd 即主树路径(main-only 方案下全部槽位都是它)
+  echo "重入:manifest 唯一解析一致(roster 全值一致、cwd 属冻结方案 $PATH_PLAN);复用已有看板,只补缺、不覆盖"
 else
-  CREATE_ID=$(date +%s)-$RANDOM                         # 建目录批次号:任务身份的一部分,只在新建时取
+  # 路径方案只在**新建**分支里按当前 git 状态定死;重入一律从上面的冻结方案恢复
+  # (先分类后算路径:main-only 建好之后再 git init,重入仍是 main-only,不因当前是 git 仓库改判)
+  #   git 仓库 → orch 槽位 cwd = 主树,每个非 orch 槽位各一条兄弟 worktree;非 git → 全部 N 个 cwd 都记主树(只允许在有人在场模式下)
+  if git -C "$PWD" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+    PATH_PLAN=worktree
+  else
+    PATH_PLAN=main-only
+  fi
+  CREATE_ID=$(date +%s)-$RANDOM                         # 任务身份号:只在新建时取,写进 manifest;ACK 期望也用它
   {
     echo "tag: $TAG"
     echo "roster: $ROSTER_NORM"
@@ -356,27 +451,39 @@ else
     echo "created: $(date -Is)"
     echo "bootstrap-id: $CREATE_ID"
   } > "$TD/manifest.txt"
+  TASK_ID=$CREATE_ID
   for s in $SLOTS; do EXPECT_OF[$s]=$(expect_of "$s"); done   # 与重入分支同款:新建分支也要把逐槽位预期 cwd 填满
                                                               # (r5 把三个 EXPECT_* 写在两分支共用处;r6 泛化时只留在重入分支,2026-10-09 T001-d D4)
   echo "新建:任务目录已初始化(路径方案 $PATH_PLAN;锁已上,ACK 通过后释放)"
 fi
+export TASK_ID                                          # 任务身份号随环境传给复用检查(重建 ACK 期望要它)
 # ══ 首次流程块(止)══
 
-# 复用检查:JSON 精确匹配 N 个完整 agent 名;再逐槽位核对其 cwd == 该槽位**预期 cwd**(git 方案=该槽位 worktree;
-# 非 git 降级=主树)——预期值一律来自上面 manifest
+# 复用检查:JSON 精确匹配 N 个完整 agent 名;再逐槽位核对其 cwd == 该槽位**预期 cwd**(按冻结路径方案)
 # (不是要求各槽位 cwd 相等——同 tab 但错跑到别的目录,一样不能复用);
 # 两侧都过 realpath 规范化后比较——带 .. 的拼法与规范 cwd 指向同一目录时必须判等,否则正常重入会被误判;
-# tab_id/workspace_id 任一缺失即非零退出(fail-closed),不拿"能打印出结论"当通过
+# tab_id/workspace_id 任一缺失即非零退出(fail-closed),不拿"能打印出结论"当通过;
+# 已注册成员的实际后端 kind(输出里带这个字段时)必须等于冻结 roster 里该槽位的 CLI——同槽位换后端 = 身份不符;
 # 无钩子槽位($HOOKLESS,每项 <slot>=<cli>;档案声明不进 herdr 注册表,如 genox)豁免 agent-list 存在性,改验三件:
-#   ① pane 身份:panes.txt 记的 pane 仍在,label == <slot>-<tag>,同 tab,cwd 与预期一致;
-#   ② pane 进程存活:前台进程非空,且进程名 == 该槽位声明的 CLI(不在 = 缺,只补这一格);
-#   ③ 落盘 ACK 身份:bootstrap-ack.md 与本次 ack-expected 全文全等(不是本任务的 ACK 不认,防跨任务复用)
-# 预期路径用**引用的 bash 数组**逐项成 argv 传(含空格的路径不被拆);解析器先断言"槽位数 == 路径数、非空、唯一"再比对。
+#   ① pane 身份:panes.txt 里该槽位的映射**唯一**(缺字段/重复行/重复 pane 都 rc=3),按 pane ID(不是按标签)
+#      查 pane list,核 label == <slot>-<tag>、同 tab/workspace、该 pane 自己的 cwd 与预期一致;
+#   ② 同一格的进程证据:pane-info-<slot>.json 的 process_info.pane_id 必须 == ①的 pane ID(不许拿别的 pane 的
+#      进程证据来拼),前台进程非空,进程名 == 该槽位声明的 CLI,进程 cwd 与预期一致(进程不在 = 缺,只补这一格);
+#   ③ 落盘 ACK 身份:用**已唯一解析的任务身份**(TASK_ID)+ tag + 当前 N 个成员全名**重建** N+2 行期望,
+#      再与 bootstrap-ack.md 全文等值(空期望/错 tag/错 bootstrap-id/错成员序全拒;不是存在性 grep);
+# 顺序:先把**全部在场成员**的身份都检完,任何不一致优先 rc=3;通过后才算缺失集合,rc=2 只报缺的槽位。
+# 缺失清单落 $TD/missing-slots.txt(单行空格分隔),供"只补缺"的拉起分支读;预期路径用**引用的 bash 数组**
+# 逐项成 argv 传(含空格的路径不被拆);解析器先断言"槽位数 == 路径数、非空、唯一"再比对。
 herdr agent list > "$TD/agent-list.json"
 herdr pane list  > "$TD/pane-list.json"
 for _hs in $HOOKLESS; do
   s=${_hs%%=*}                                          # $HOOKLESS 每项是 <slot>=<cli>:取槽位名去查 panes.txt 与落 pane-info
-  p=$( [ -s "$TD/panes.txt" ] && awk -v s="$s" '$1 == s {print $2}' "$TD/panes.txt" )
+  p=""
+  if [ -s "$TD/panes.txt" ]; then
+    # panes.txt 该槽位的映射必须恰好一条且两段非空:缺字段/重复映射都 fail-closed(不许挑一行凑合)
+    p=$(awk -v s="$s" '$1 == s {n++; id=$2} END {if (n != 1) exit 1; print id}' "$TD/panes.txt") \
+      || { echo "panes.txt 里槽位 $s 的 pane 映射缺失或重复(<slot> <pane_id> 须恰好一条):fail-closed,人工确认"; exit 3; }
+  fi
   [ -n "$p" ] || continue                               # 没有 pane 记录 → 交给解析器按"缺成员"报(新建时本来就没有 pane)
   herdr pane process-info --pane "$p" > "$TD/pane-info-$s.json" \
     || { echo "无钩子槽位 $s 的 pane process-info 取不到:fail-closed,人工确认"; exit 3; }
@@ -387,60 +494,137 @@ python3 -c '
 import json,os,sys
 tag=sys.argv[1]; slots=sys.argv[2].split(); hookless=sys.argv[3].split()
 td=sys.argv[4]; paths=sys.argv[5:]
+taskid=os.environ.get("TASK_ID",""); rnorm=os.environ.get("ROSTER_NORM","")
+def bad(msg):
+    print(msg); sys.exit(3)
 if not slots or len(set(slots))!=len(slots) or len(paths)!=len(slots) or any(not p for p in paths):
-    print("复用检查入参不完整:槽位 %d 个、路径 %d 个(fail-closed,不复用)"%(len(slots),len(paths))); sys.exit(3)
+    bad("复用检查入参不完整:槽位 %d 个、路径 %d 个(fail-closed,不复用)"%(len(slots),len(paths)))
+if not taskid or not rnorm:
+    bad("复用检查缺任务身份/规范 roster(TASK_ID/ROSTER_NORM 环境变量):fail-closed,不复用")
+cli={}
+for part in rnorm.split("+"):
+    seg=part.replace("=",":",1).split(":")
+    if len(seg)<2 or not seg[0] or not seg[1]: bad("规范 roster 解析不过: "+part)
+    cli[seg[0]]=seg[1]
+if set(cli)!=set(slots): bad("规范 roster 的槽位集合与本次槽位表不符:fail-closed")
 hook=dict(h.split("=",1) for h in hookless)
-agents=json.load(open(os.path.join(td,"agent-list.json")))["result"]["agents"]
-panes=json.load(open(os.path.join(td,"pane-list.json")))["result"]["panes"]
 expect={s:p for s,p in zip(slots,paths)}
 def norm(p):
     return os.path.realpath(p) if p else p
-def bad(msg):
-    print(msg); sys.exit(3)
-def pinfo(s):
-    f=os.path.join(td,"pane-info-"+s+".json")
-    if not os.path.exists(f): return {}
-    return json.load(open(f)).get("result",{}).get("process_info",{})
-got={a.get("name"):a for a in agents}
-missing=[s for s in slots if s not in hook and (s+"-"+tag) not in got]
+def load(name):
+    f=os.path.join(td,name)
+    if not os.path.exists(f): return None
+    try:
+        return json.load(open(f,encoding="utf-8"))
+    except Exception as e:
+        bad(name+" 读不出或不是合法 JSON: "+str(e)+":fail-closed,不复用")
+def panes_txt():                                        # panes.txt 的唯一解析:缺字段/重复槽位/重复 pane 都 rc=3
+    f=os.path.join(td,"panes.txt")
+    if not os.path.exists(f): return {},False           # 还没有 panes.txt = 全新任务,不算不一致
+    m={}; ids={}
+    for i,l in enumerate(open(f,encoding="utf-8"),1):
+        l=l.rstrip("\n")
+        if not l: bad("panes.txt 第 %d 行是空行:fail-closed"%i)
+        parts=l.split()
+        if len(parts)!=2: bad("panes.txt 第 %d 行不是 <slot> <pane_id> 两段: %r,fail-closed"%(i,l))
+        s,p=parts
+        if s in m: bad("panes.txt 里槽位 %s 有多条 pane 映射:fail-closed"%s)
+        if p in ids: bad("panes.txt 里 pane %s 被多个槽位引用:fail-closed"%p)
+        m[s]=p; ids[p]=s
+    return m,True
+al=load("agent-list.json"); pl=load("pane-list.json")
+if al is None or pl is None: bad("agent-list.json / pane-list.json 缺一个:fail-closed,不复用")
+agents=al.get("result",{}).get("agents"); panes=pl.get("result",{}).get("panes")
+if not isinstance(agents,list) or not isinstance(panes,list): bad("agent list / pane list 结构不是列表:fail-closed")
+got={}
+for a in agents:
+    n=a.get("name")
+    if n in got: bad("agent list 里重名 %r:fail-closed"%n)
+    got[n]=a
+pane_by_id={}
+for p in panes:
+    pid=p.get("pane_id")
+    if not pid: bad("pane list 有条目缺 pane_id:fail-closed")
+    if pid in pane_by_id: bad("pane list 里 pane_id %s 重复:fail-closed"%pid)
+    pane_by_id[pid]=p
+ptxt, ptxt_ok = panes_txt()
+tabs=set(); missing=[]; why={}; hook_live=False
+for s in slots:                                         # 顺序:先全部在场成员身份,再算缺失(E2-4)
+    if s in hook:
+        pid=ptxt.get(s)
+        if pid is None:
+            if ptxt_ok: bad("panes.txt 在、却没有槽位 %s 的 pane 映射:不一致,fail-closed"%s)
+            missing.append(s); why[s]="还没有 pane 记录(fresh)"; continue
+        pane=pane_by_id.get(pid)
+        if pane is None: bad("无钩子槽位 %s 的 pane %s 不在 pane list 里:fail-closed"%(s,pid))
+        if pane.get("label")!=s+"-"+tag:
+            bad("pane %s 的 label=%r ≠ %s:证据不是同一格,fail-closed"%(pid,pane.get("label"),s+"-"+tag))
+        if not pane.get("tab_id") or not pane.get("workspace_id"): bad("pane %s 缺 tab_id/workspace_id:fail-closed"%pid)
+        if norm(pane.get("cwd"))!=norm(expect[s]):
+            bad("pane %s 的 cwd=%s ≠ 预期 %s(realpath 规范化后仍不同):fail-closed"%(pid,pane.get("cwd"),expect[s]))
+        info=load("pane-info-"+s+".json")
+        if info is None: bad("无钩子槽位 %s 缺 pane-info-%s.json(进程证据):fail-closed"%(s,s))
+        pi=info.get("result",{}).get("process_info")
+        if not isinstance(pi,dict): bad("pane-info-%s.json 里没有 process_info:fail-closed"%s)
+        if pi.get("pane_id")!=pid:
+            bad("槽位 %s 的进程证据来自 pane %s、panes.txt 记的是 %s:不许拼接不同 pane 的证据,fail-closed"%(s,pi.get("pane_id"),pid))
+        procs=pi.get("foreground_processes") or []
+        if not procs:
+            missing.append(s); why[s]="pane 内无前台进程(在原 pane 上重起)"; continue
+        p0=procs[0]; pname=p0.get("name") or ((p0.get("argv") or [""])[0])
+        if pname!=hook[s]: bad("槽位 %s pane 前台进程=%s ≠ 该槽位 CLI=%s:fail-closed,人工确认"%(s,pname,hook[s]))
+        if norm(p0.get("cwd"))!=norm(expect[s]):
+            bad("槽位 %s pane 进程 cwd=%s ≠ 预期 %s(realpath 规范化后仍不同):fail-closed"%(s,p0.get("cwd"),expect[s]))
+        tabs.add(pane.get("tab_id")); hook_live=True
+    else:
+        w=s+"-"+tag; a=got.get(w)
+        if a is None:
+            missing.append(s); why[s]="agent list 里没有"; continue
+        if not a.get("tab_id") or not a.get("workspace_id"): bad(w+" 缺 tab_id/workspace_id,fail-closed:不复用")
+        if norm(a.get("cwd"))!=norm(expect[s]): bad(w+" cwd="+str(a.get("cwd"))+" ≠ 预期 "+str(expect[s])+"(realpath 规范化后仍不同):不复用")
+        k=a.get("kind")
+        if k is not None and k!=cli[s]:
+            bad(w+" 实际后端 kind="+str(k)+" ≠ 冻结 roster 的 CLI="+cli[s]+":身份不符,fail-closed")
+        tabs.add(a.get("tab_id"))
+if len(tabs)>1: bad("成员不在同一 tab: "+", ".join(sorted(str(t) for t in tabs)))
+if hook_live:                                           # 有在场无钩子实例:落盘 ACK 必须等于**重建**的期望
+    want="bootstrap-id: "+taskid+"\ntag: "+tag+"\n"+"".join(s+"-"+tag+"\n" for s in slots)
+    n_exp=len(slots)+2
+    ef=os.path.join(td,"ack-expected")
+    if os.path.exists(ef) and open(ef,encoding="utf-8").read()!=want:
+        bad("落盘 ack-expected 与按任务身份重建的期望不同:身份没显式更新或被改过,fail-closed")
+    af=os.path.join(td,"bootstrap-ack.md")
+    ack=open(af,encoding="utf-8").read() if os.path.exists(af) else ""
+    if ack!=want:
+        bad("无钩子槽位复用的落盘 ACK 身份不成立:与按任务身份重建的 %d 行期望不全等(空/错 tag/错 bootstrap-id/错成员序都算):fail-closed,人工确认"%n_exp)
+open(os.path.join(td,"missing-slots.txt"),"w",encoding="utf-8").write(" ".join(missing)+"\n")
 if missing:
-    print("缺: "+", ".join(s+"-"+tag for s in missing)); sys.exit(2)
-by_label={p.get("label"):p for p in panes}
-tabs=set()
-for s in slots:
-    if s in hook: continue
-    w=s+"-"+tag; a=got[w]
-    if not a.get("tab_id") or not a.get("workspace_id"):
-        bad(w+" 缺 tab_id/workspace_id,fail-closed:不复用")
-    if norm(a.get("cwd"))!=norm(expect[s]):
-        bad(w+" cwd="+str(a.get("cwd"))+" ≠ 预期 worktree="+str(expect[s])+"(realpath 规范化后仍不同):不复用")
-    tabs.add(a.get("tab_id"))
-for s in sorted(hook):
-    w=s+"-"+tag; pane=by_label.get(w)
-    if pane is None:
-        print("缺: "+w+"(无钩子槽位:panes.txt 记的 pane 不在 list 里,按只补缺在该 pane 重起)"); sys.exit(2)
-    procs=pinfo(s).get("foreground_processes") or []
-    if not procs:
-        print("缺: "+w+"(无钩子槽位:pane 内无前台进程,按只补缺在该 pane 重起)"); sys.exit(2)
-    p0=procs[0]; pname=p0.get("name") or ((p0.get("argv") or [""])[0])
-    if pname!=hook[s]:
-        bad(w+" pane 前台进程="+str(pname)+" ≠ 该槽位 CLI="+hook[s]+":fail-closed,人工确认")
-    if norm(p0.get("cwd"))!=norm(expect[s]):
-        bad(w+" pane 进程 cwd="+str(p0.get("cwd"))+" ≠ 预期 worktree="+str(expect[s])+"(realpath 规范化后仍不同):不复用")
-    if not pane.get("tab_id") or not pane.get("workspace_id"):
-        bad(w+" pane 缺 tab_id/workspace_id,fail-closed:不复用")
-    tabs.add(pane.get("tab_id"))
-if len(tabs)!=1:
-    bad("成员不在同一 tab: "+", ".join(sorted(str(t) for t in tabs)))
-if hook:
-    ack=os.path.join(td,"bootstrap-ack.md"); want=os.path.join(td,"ack-expected")
-    ok=os.path.exists(ack) and os.path.exists(want) and open(ack,"rb").read()==open(want,"rb").read()
-    if not ok:
-        bad("无钩子槽位复用的落盘 ACK 身份不成立(bootstrap-ack.md 与本次 ack-expected 不全等):fail-closed,人工确认")
-print("%d 名成员齐全:同 tab,各自 cwd 与预期 worktree 一致(realpath 规范化后);无钩子槽位 pane 进程存活且落盘 ACK 身份已核"%len(slots))' \
+    print("缺: "+", ".join(s+"-"+tag+"("+why[s]+")" for s in missing)+":只补缺,只对这几格动手,已在场成员一个都不重启")
+    print("missing-slots: "+" ".join(missing)); sys.exit(2)
+print("%d 名成员齐全:同 tab,各自 cwd 与预期一致(realpath 规范化后);已注册成员后端与冻结 roster 一致;无钩子槽位 pane 身份链(panes.txt→pane list→同一 pane 的进程证据)已核,落盘 ACK 与重建期望全文全等"%len(slots))' \
   "$TAG" "$SLOTS" "$HOOKLESS" "$TD" "${EXPECT_ARGS[@]}"
-# 退出码:0 = 可复用;2 = 缺成员(只补缺的;无钩子槽位 = pane 内无进程);
-# 3 = 拓扑/目录不一致、缺字段,或无钩子槽位 ACK 身份不成立(fail-closed,不自动复用,人工确认后重建)
+# 复用检查的结论 → 本次拉起做什么:0 = 全可复用(一个都不起);2 = 只补缺(只迭代 $MISSING_SLOTS);
+# 其它(3 = 拓扑/目录/身份不符)= fail-closed,停在这里人工确认。清单读回后再核一遍(空/含未知槽位/重复都 fail-closed)
+_reuse_rc=$?
+REUSE=""
+MISSING_SLOTS=""
+case "$_reuse_rc" in
+  0) REUSE=ok ;;
+  2) REUSE=refill
+     MISSING_SLOTS=$(cat "$TD/missing-slots.txt" 2>/dev/null) \
+       || { echo "读不到缺失槽位清单 $TD/missing-slots.txt:fail-closed,人工确认"; exit 3; }
+     [ -n "$MISSING_SLOTS" ] || { echo "缺失槽位清单为空、退出码却是 2:自相矛盾,fail-closed"; exit 3; }
+     for s in $MISSING_SLOTS; do
+       case " $SLOTS " in *" $s "*) ;; *) echo "缺失槽位清单含不在本次槽位表里的 $s:fail-closed"; exit 3 ;; esac
+     done
+     [ "$(printf '%s\n' $MISSING_SLOTS | sort | uniq -d | wc -l)" = 0 ] \
+       || { echo "缺失槽位清单里有重复:fail-closed"; exit 3; }
+     ;;
+  *) echo "复用检查判 ${_reuse_rc}(身份/拓扑/目录不符):fail-closed,人工确认后再拉起"; exit 3 ;;
+esac
+export REUSE MISSING_SLOTS
+# 退出码:0 = 可复用(REUSE=ok);2 = 缺成员(REUSE=refill,只补 $MISSING_SLOTS 里的槽位;无钩子槽位 = pane 内无进程);
+# 3 = 拓扑/目录不一致、缺字段、pane 证据链拼接,或无钩子槽位 ACK 身份不成立(fail-closed,不自动复用,人工确认后重建)
 # 预期 cwd 一律取自 manifest:新建时按"首次流程块"定好的路径方案写死(git→主树+N−1 条兄弟 worktree;
 # 非 git→N 个 cwd 都记主树,只允许在有人在场模式下),重入时经唯一解析取出——这里把 N 个预期路径传给复用检查
 ```
@@ -473,75 +657,136 @@ print("%d 名成员齐全:同 tab,各自 cwd 与预期 worktree 一致(realpath 
 
 ```bash
 # 0) 非 orch 槽位各一条 worktree(已存在则跳过);分支名带 tag 与槽位名,互不重叠。
-#    只按"首次流程块"定下的路径方案执行:非 git 降级(main-only)跳过,N 个 cwd 都用主树
-if [ "$PATH_PLAN" = worktree ]; then
+#    只按"首次流程块"定下的路径方案执行:非 git 降级(main-only)跳过,N 个 cwd 都用主树;重入一个都不建
+if [ "$CLASSIFY" = new ] && [ "$PATH_PLAN" = worktree ]; then
   for s in $SLOTS; do
     [ "$s" = orch ] && continue
     git worktree add "$PWD/../wt-$TAG-$s" -b "trio-$TAG-$s"
   done
 fi
 
-# 1) 新 tab:orch 槽位留主树;根面板 P0 从返回 JSON 解析
-P0=$(herdr tab create --workspace "$HERDR_WORKSPACE_ID" --cwd "${EXPECT_OF[orch]}" --label <任务名> --no-focus \
-     | python3 -c 'import json,sys;print(json.load(sys.stdin)["result"]["root_pane"]["pane_id"])')
-# 2) 裂 pane 循环(P0 = orch 位):非 orch 成员按声明序 M1…M(N−1);
-#    M1:P0 --direction right → P1;Mk(k≥2):P(k−1) --direction down → Pk。
-#    N=3 时与现行布局逐 pane 一致;N>3 时右列继续向下竖排延伸。
-#    每裂一格即从返回 JSON 解析 pane_id,不要手抄;并落盘 $TD/panes.txt(`<slot> <pane_id>` 每行一条)。
-#    槽位 → pane 用**关联数组** PANE_OF 记(不再按槽位名拼变量名):起代理与 rename 循环都从这里取,
-#    且逐槽位断言非空——写进 PANE_OF_ORCH、读成 PANE_ORCH 这类名字错位会让 pane 取空,必须当场停。
-declare -A PANE_OF
-PANE_OF[orch]=$P0
-: > "$TD/panes.txt"; echo "orch $P0" >> "$TD/panes.txt"
-prev=$P0; first=1
-for s in $SLOTS; do
-  [ "$s" = orch ] && continue
-  if [ "$first" = 1 ]; then dir=right; first=0; else dir=down; fi
-  p=$(herdr pane split "$prev" --direction "$dir" --cwd "$(expect_of "$s")" --no-focus \
-      | python3 -c 'import json,sys;print(json.load(sys.stdin)["result"]["pane"]["pane_id"])')
-  [ -n "$p" ] || { echo "槽位 $s 的 pane_id 解析为空:停下人工确认"; exit 1; }
-  PANE_OF[$s]=$p
-  echo "$s $p" >> "$TD/panes.txt"
-  prev=$p
-done
+declare -A PANE_OF                                       # 槽位 → pane:起代理与改名都从这里取,逐槽位断言非空
+START_SLOTS=""                                           # 本次要起代理的槽位:新建=全部;重入补缺=只缺的那些
 
-# 3) 起代理循环:按槽位查"后端档案",参数取自"模式选择"的数组;写死 bypass/auto 属流程违规。
+if [ "$CLASSIFY" = new ]; then
+  START_SLOTS=$SLOTS                                     # 新建:全部槽位都要起
+  # 1) 新 tab:orch 槽位留主树;根面板 P0 从返回 JSON 解析
+  P0=$(herdr tab create --workspace "$HERDR_WORKSPACE_ID" --cwd "${EXPECT_OF[orch]}" --label <任务名> --no-focus \
+       | python3 -c 'import json,sys;print(json.load(sys.stdin)["result"]["root_pane"]["pane_id"])')
+  # 2) 裂 pane 循环(P0 = orch 位):非 orch 成员按声明序 M1…M(N−1);
+  #    M1:P0 --direction right → P1;Mk(k≥2):P(k−1) --direction down → Pk。
+  #    N=3 时与现行布局逐 pane 一致;N>3 时右列继续向下竖排延伸。
+  #    每裂一格即从返回 JSON 解析 pane_id,不要手抄;并落盘 $TD/panes.txt(`<slot> <pane_id>` 每行一条)。
+  #    槽位 → pane 用**关联数组** PANE_OF 记(不再按槽位名拼变量名):起代理与改名循环都从这里取,
+  #    且逐槽位断言非空——写进 PANE_OF_ORCH、读成 PANE_ORCH 这类名字错位会让 pane 取空,必须当场停。
+  PANE_OF[orch]=$P0
+  : > "$TD/panes.txt"; echo "orch $P0" >> "$TD/panes.txt"
+  prev=$P0; first=1
+  for s in $SLOTS; do
+    [ "$s" = orch ] && continue
+    if [ "$first" = 1 ]; then dir=right; first=0; else dir=down; fi
+    p=$(herdr pane split "$prev" --direction "$dir" --cwd "$(expect_of "$s")" --no-focus \
+        | python3 -c 'import json,sys;print(json.load(sys.stdin)["result"]["pane"]["pane_id"])')
+    [ -n "$p" ] || { echo "槽位 $s 的 pane_id 解析为空:停下人工确认"; exit 1; }
+    PANE_OF[$s]=$p
+    echo "$s $p" >> "$TD/panes.txt"
+    prev=$p
+  done
+elif [ "${REUSE:-}" = refill ]; then
+  # 重入补缺:**只**迭代 $MISSING_SLOTS,已在场成员一个都不动(不重发 agent start/pane run、不新建 pane/tab);
+  # pane 一律用首次拉起落在 panes.txt 里的原 pane——重入不裂新 pane(几何不是协议身份,身份锚在 manifest/panes.txt)
+  START_SLOTS=$MISSING_SLOTS
+  for s in $START_SLOTS; do
+    p=$(awk -v s="$s" '$1 == s {n++; id=$2} END {if (n != 1) exit 1; print id}' "$TD/panes.txt") \
+      || { echo "panes.txt 里槽位 $s 的 pane 映射缺失或重复:fail-closed,人工确认"; exit 3; }
+    [ -n "$p" ] || { echo "panes.txt 里槽位 $s 没有 pane ID:fail-closed,人工确认"; exit 3; }
+    PANE_OF[$s]=$p
+  done
+elif [ "${REUSE:-}" = ok ]; then
+  :                                                      # 全可复用:一个都不起,也不动面板
+else
+  echo "没有可用的复用检查结论(REUSE=${REUSE:-未设}、分类 ${CLASSIFY}):不许盲目拉起,停下人工确认"; exit 3
+fi
+
+# 3) 起代理循环:按槽位查"后端档案",权限参数取自"模式选择"的数组,**模型/推理档逐槽位**从规范 roster 合成;
+#    写死 bypass/auto 属流程违规,把模型写死在共用数组里同样属流程违规(同 CLI 的两格会互相顶掉)。
 #    分流按该槽位的 **cli**(不是槽位名):herdr agent start 需要 --kind(kimi/codex/claude 等);
-#    档案声明"无钩子"的成员(genox)不进注册表,改由 pane 直起(`pane run genox`;当前已装版 3.0.1 暂用 `genox chat`,见"后端档案"genox 条),
-#    不伪造 kind 注册、也不因它没进 agent list 就判"缺成员"。
-for s in $SLOTS; do
+#    档案声明"无钩子"的成员(genox)不进注册表,改由 pane 直起(`pane run genox`;当前已装版 3.0.1 裸 `genox` 报
+#    `Missing command`(实测,退出码 2),暂用 `genox chat`;上游 PR 合并后裸命令与之等价——该等价性 **[未实测]**,
+#    见"后端档案"genox 条),不伪造 kind 注册、也不因它没进 agent list 就判"缺成员"。
+SLOT_ARGS=()                                            # 合成产物:每次调用前清空
+slot_argv_of() {                                        # $1 = slot:只从该槽位的规范 roster 声明合成(闸⑧已挡住"声明了却没有 flag"的入参)
+  SLOT_ARGS=()
+  case "${CLI_OF[$1]}" in
+    kimi)   if [ -n "${MODEL_OF[$1]}" ]; then SLOT_ARGS+=(-m "${MODEL_OF[$1]}"); fi ;;
+    codex)  if [ -n "${MODEL_OF[$1]}" ]; then SLOT_ARGS+=(-m "${MODEL_OF[$1]}"); fi
+            if [ -n "${EFFORT_OF[$1]}" ]; then SLOT_ARGS+=(-c "model_reasoning_effort=${EFFORT_OF[$1]}"); fi ;;
+    claude) if [ -n "${MODEL_OF[$1]}" ]; then SLOT_ARGS+=(--model "${MODEL_OF[$1]}"); fi
+            if [ -n "${EFFORT_OF[$1]}" ]; then SLOT_ARGS+=(--effort "${EFFORT_OF[$1]}"); fi ;;
+    *)      if [ -n "${MODEL_OF[$1]}${EFFORT_OF[$1]}" ]; then
+              echo "槽位 $1 的 CLI ${CLI_OF[$1]} 没有登记的模型/推理档合成规则:不静默丢弃,停下按'后端档案'补规则"
+              return 1
+            fi ;;
+  esac
+  return 0
+}
+for s in $START_SLOTS; do
   pane=${PANE_OF[$s]}
   [ -n "$pane" ] || { echo "槽位 $s 没有 pane(裂 pane 循环未赋值):停下人工确认"; exit 1; }
+  slot_argv_of "$s" || exit 1
   case "${CLI_OF[$s]}" in
     genox)  herdr pane run "$pane" "genox chat" ;;                    # 无钩子:唯一可用档=有人在场;参数见"后端档案"
-    kimi)   herdr agent start "$s-$TAG" --kind kimi   --pane "$pane" -- "${KIMI_ARGS[@]}" ;;
-    codex)  herdr agent start "$s-$TAG" --kind codex  --pane "$pane" -- "${CODEX_ARGS[@]}" ;;
-    claude) herdr agent start "$s-$TAG" --kind claude --pane "$pane" -- "${CLAUDE_ARGS[@]}" ;;
+    kimi)   herdr agent start "$s-$TAG" --kind kimi   --pane "$pane" -- "${KIMI_ARGS[@]}"   "${SLOT_ARGS[@]}" ;;
+    codex)  herdr agent start "$s-$TAG" --kind codex  --pane "$pane" -- "${CODEX_ARGS[@]}"  "${SLOT_ARGS[@]}" ;;
+    claude) herdr agent start "$s-$TAG" --kind claude --pane "$pane" -- "${CLAUDE_ARGS[@]}" "${SLOT_ARGS[@]}" ;;
     *)      echo "槽位 $s 的 CLI ${CLI_OF[$s]} 未在本循环登记参数组:按'后端档案'实测补一条 case(不套用上面的值)后再拉起"; exit 1 ;;
   esac
 done
-# 默认 roster 展开后等价于:
-#   herdr agent start "orch-$TAG" --kind kimi  --pane "${PANE_OF[orch]}" --
-#   herdr agent start "rev-$TAG"  --kind codex --pane "${PANE_OF[rev]}"  -- -m gpt-6.1-sol -c model_reasoning_effort=high
+# 默认 roster 展开后等价于(权限数组只放权限档参数,模型/推理档来自各槽位的 roster 声明):
+#   herdr agent start "orch-$TAG" --kind kimi  --pane "${PANE_OF[orch]}" -- "${KIMI_ARGS[@]}"
+#   herdr agent start "rev-$TAG"  --kind codex --pane "${PANE_OF[rev]}"  -- "${CODEX_ARGS[@]}"  -m gpt-6.1-sol -c model_reasoning_effort=high
 #   herdr agent start "exec-$TAG" --kind claude --pane "${PANE_OF[exec]}" -- "${CLAUDE_ARGS[@]}"
 # 数组元素逐项成为独立 argv,含空格路径也不拆、空数组不产生参数;不要退回字符串拼接(见"模式选择"的实测)
 # 模型 slug 与推理档必须分开传:slug 不带档位,档位用独立配置键;`--settings` 用技能目录变量拼路径、不写死用户名
 
-# 4) N 个面板全部重命名(必做,漏了代理名与显示标签不一致);pane label 与 agent 名是两个对象
-for s in $SLOTS; do
+# 4) 本次要起的面板改名(新建=全部;重入补缺=只改缺的那些);pane label 与 agent 名是两个对象
+for s in $START_SLOTS; do
   pane=${PANE_OF[$s]}
   [ -n "$pane" ] || { echo "槽位 $s 没有 pane(裂 pane 循环未赋值):停下人工确认"; exit 1; }
   herdr pane rename "$pane" "$s-$TAG"
 done
 
 # 5) bootstrap:任务目录/manifest/锁已在"检测"一步办妥 → 建看板骨架(仅缺时;重入不覆盖)→
-#    取本次拉起批次号 bootstrap ID → 等 ACK 与预期全文全等(cmp)——这才是"拉起完成"的判据
+#    定**任务身份号 task ID**(bootstrap-id)→ 等 ACK 与预期全文全等(cmp)——这才是"拉起完成"的判据
 TD="/tmp/$TAG"                             # 与"首次流程块"同一个任务目录;此处重设,本块可单独抽取自测
 mkdir -p "$TD"                             # 幂等
 SKILL_ABS=<发送方已知的技能绝对路径>        # 如 /home/<user>/.kimi-code/skills/trio-orchestrate;包内一律写绝对路径,不假设对端会展开 ${KIMI_SKILL_DIR}
 # ══ bootstrap ACK 闭环块(起):整段抽出去、设好 TD/TAG/SKILL_ABS/SLOTS 即可单独跑(对端 herdr 可用桩替)══
-# 秒+随机尾只是降低撞车概率,不承诺并发唯一;并发排他靠 launch.lock——一个 TAG 同时只许一个拉起流程
-BOOT_ID=$(date +%s)-$RANDOM                # 本次拉起批次号:旧 ACK、失败残留靠它区分
+CLASSIFY=${CLASSIFY:-new}                  # 单独抽取本块自测时的默认值:按"新建"走(不碰 manifest)
+START_SLOTS=${START_SLOTS:-$SLOTS}         # 同上:默认全部槽位
+# 任务身份号只有**一个**来源,三处必须同源:manifest 的 bootstrap-id 行、ACK 期望、给对方抄的样本。
+#   新建:身份号 = 首次流程块铸的 CREATE_ID(已写进 manifest),本块只读不改;
+#   重入且本次真起了代理(补缺/重组):**显式换新身份号**——先原子改写 manifest 的 bootstrap-id 行,再据此重建 ACK 期望。
+#     不许隐式沿用旧身份号:旧 ACK 认的正是旧号,不换号就等于"新旧两批成员共用一张回执",身份链断了也看不出来。
+#   重入且一个都没起(REUSE=ok):沿用 manifest 里的身份号,不重发 bootstrap(成员都在场,旧 ACK 依然有效)。
+if [ -n "$START_SLOTS" ] && [ "$CLASSIFY" = reentry ]; then
+  TASK_ID=$(date +%s)-$RANDOM
+  python3 - "$TD/manifest.txt" "$TASK_ID" <<'PY' || { echo "重组换任务身份号失败(manifest 改不动):fail-closed,人工确认"; exit 1; }
+import os, sys
+path, tid = sys.argv[1], sys.argv[2]
+with open(path, encoding="utf-8") as f:
+    lines = f.read().splitlines()
+hit = [i for i, x in enumerate(lines) if x.startswith("bootstrap-id: ")]
+if len(hit) != 1:
+    sys.exit("manifest 的 bootstrap-id 行不是恰好一条:fail-closed,人工确认")
+lines[hit[0]] = "bootstrap-id: " + tid
+tmp = path + ".tmp"
+with open(tmp, "w", encoding="utf-8") as f:
+    f.write("\n".join(lines) + "\n")
+os.replace(tmp, path)                      # 同目录改写:要么旧全文、要么新全文,不留半截文件
+PY
+fi
+[ -n "${TASK_ID:-}" ] || { echo "任务身份号为空(新建/重入都没铸):fail-closed,人工确认"; exit 1; }
 [ -f "$TD/taskboard.md" ] || cat > "$TD/taskboard.md" <<'EOF'
 # taskboard
 
@@ -552,29 +797,33 @@ BOOT_ID=$(date +%s)-$RANDOM                # 本次拉起批次号:旧 ACK、失
 EOF
 # 行数随 N 变:ACK 预期 = bootstrap-id 行 + tag 行 + N 行 <slot>-<tag>(槽位固定序),末尾保留一个换行
 NAMES=$(for s in $SLOTS; do echo "$s-$TAG"; done)      # N 个全名,槽位固定序
-rm -f "$TD/bootstrap-ack.md"               # 清掉旧 ACK:只认本次写出的回执
-{
-  echo "bootstrap-id: $BOOT_ID"
-  echo "技能文件:$SKILL_ABS/SKILL.md(绝对路径;先激活技能并读这个文件,不要依赖占位符自动展开)"
-  echo "tag: $TAG"
-  echo "看板:$TD/taskboard.md(骨架已建好)"
-  echo "成员全名:$(echo $NAMES | tr ' ' '/')(编排 + 审阅 + 执行等;限 [机核] 的条目见看板规则)"
-  echo "指令:读技能与看板后,把 ACK 写到 $TD/bootstrap-ack.md。ACK 必须与下面 $((N + 2)) 行**逐字节一致**(照抄、一行一项、不加别的字符、行尾不留空格、末尾保留一个换行):"
-  echo "bootstrap-id: $BOOT_ID"
-  echo "tag: $TAG"
-  for n in $NAMES; do echo "$n"; done
-  echo "不要再执行拉起流程(不要建新 tab、不要起新代理)。"
-} > "$TD/bootstrap.md"
-# 预期 ACK 全文(与上面给对方的 $((N + 2)) 行逐字节一致),验收用全等比较:
-# 存在性 grep 挡不住"同一字段两个矛盾值 / 重复行 / 多余行"(2026-10-09 裁决),必须整文比
-{
-  echo "bootstrap-id: $BOOT_ID"
-  echo "tag: $TAG"
-  for n in $NAMES; do echo "$n"; done
-} > "$TD/ack-expected"
-herdr agent prompt "orch-$TAG" "读 $TD/bootstrap.md 并按其指令执行" --wait --timeout 120000
-ack="$TD/bootstrap-ack.md"
-cmp -s "$TD/ack-expected" "$ack" || { echo "ACK 与预期全文不一致(矛盾/重复/多余行或缺行):拉起未完成"; exit 1; }
+if [ -n "$START_SLOTS" ]; then
+  rm -f "$TD/bootstrap-ack.md"             # 清掉旧 ACK:只认本次写出的回执(换了身份号时,这步同时作废旧号回执)
+  {
+    echo "bootstrap-id: $TASK_ID"
+    echo "技能文件:$SKILL_ABS/SKILL.md(绝对路径;先激活技能并读这个文件,不要依赖占位符自动展开)"
+    echo "tag: $TAG"
+    echo "看板:$TD/taskboard.md(骨架已建好)"
+    echo "成员全名:$(echo $NAMES | tr ' ' '/')(编排 + 审阅 + 执行等;限 [机核] 的条目见看板规则)"
+    echo "指令:读技能与看板后,把 ACK 写到 $TD/bootstrap-ack.md。ACK 必须与下面 $((N + 2)) 行**逐字节一致**(照抄、一行一项、不加别的字符、行尾不留空格、末尾保留一个换行):"
+    echo "bootstrap-id: $TASK_ID"
+    echo "tag: $TAG"
+    for n in $NAMES; do echo "$n"; done
+    echo "不要再执行拉起流程(不要建新 tab、不要起新代理)。"
+  } > "$TD/bootstrap.md"
+  # 预期 ACK 全文(与上面给对方的 $((N + 2)) 行逐字节一致),验收用全等比较:
+  # 存在性 grep 挡不住"同一字段两个矛盾值 / 重复行 / 多余行"(2026-10-09 裁决),必须整文比
+  {
+    echo "bootstrap-id: $TASK_ID"
+    echo "tag: $TAG"
+    for n in $NAMES; do echo "$n"; done
+  } > "$TD/ack-expected"
+  herdr agent prompt "orch-$TAG" "读 $TD/bootstrap.md 并按其指令执行" --wait --timeout 120000
+  ack="$TD/bootstrap-ack.md"
+  cmp -s "$TD/ack-expected" "$ack" || { echo "ACK 与预期全文不一致(矛盾/重复/多余行或缺行):拉起未完成"; exit 1; }
+else
+  echo "全可复用(本次没起任何代理):不重发 bootstrap——ACK 已由复用检查按同一身份号全文核过"
+fi
 rmdir "$TD/launch.lock"                    # ACK 通过 = 拉起完成,释放排他锁;中途失败停下的,人工处理完再删锁重入
 # ══ bootstrap ACK 闭环块(止)══
 ```
@@ -592,20 +841,23 @@ rmdir "$TD/launch.lock"                    # ACK 通过 = 拉起完成,释放排
 ## 组队与替补(编队成员不齐时)
 
 - **orch 槽位不可替**:技能就跑在 kimi 里,但二进制检测仍要走(当前会话能跑 ≠ PATH 里有可新起实例的 kimi);缺的是审阅/执行等其它能力才走本节;
-- **可用性两级检测,缺一不可**:① `command -v <cli>` 二进制在(PATH 里有能新起实例的 CLI;当前会话里能跑不算);② `herdr integration status` 显示 `current`(状态钩子已装)。缺②可 `herdr integration install <agent>` 补装;补不了则降级为备胎——能起跑但 idle/working 侦测不可靠,通信协议第 3 步 `agent get` 的观测失效,只能 `pane read` 人工盯(**无 kind、herdr 不认的后端如 genox 属这一类,见"后端档案"**);
+- **可用性检测(启动前)按后端档案分流,两级不是对所有后端都成立**:**有状态钩子**的后端两级都核——① `command -v <cli>` 二进制在(PATH 里有能新起实例的 CLI;当前会话里能跑不算)、② `herdr integration status` 显示 `current`(状态钩子已装);缺②可 `herdr integration install <agent>` 补装,补不了则退成备胎——能起跑但 idle/working 侦测不可靠,通信协议第 3 步 `agent get` 的观测失效,只能 `pane read` 人工盯。**档案声明"无钩子"的后端(如 genox,见"后端档案")只核 ①**:②对它必然缺失、也不该去补装,它的到场判据在**启动后**另算(见下一条),**不得因为 ② 缺失就把该候选判成不可用**;
 - **候选要记录**:每个候选写明 CLI kind + provider/模型 + 该槽位能力与权限边界;"不同后端"靠这两项判定,不能只看二进制名;候选池按**能力**查(不是按固定角色):
 
-| 能力 | 首选 | 替补顺序(示例,以两级检测实测为准) |
+| 能力 | 首选 | 替补顺序(示例,以启动前检测的实测结果为准) |
 |---|---|---|
 | orch | kimi | 无(不可替) |
 | rev | codex | copilot → opencode(先补钩子)→ 第二个 kimi |
 | exec | claude | codex → copilot → opencode(先补钩子)→ genox(有人在场档) |
 
 - **硬约束:rev 能力成员与 exec 能力成员不得同源**——同源盲点,审了等于没审。同源判定见"槽位与 roster 声明"的成对约束(不同 CLI 且不同模型族);
-- **组队用枚举,不用贪心**:对每个待填槽位给出候选池,枚举**全部组合**,取第一个满足 [能力覆盖 + 成对约束 + 两级健康检查 + 非同一 live agent] 的完整赋值。**两级健康检查按后端分流**:档案声明**有**状态钩子的后端核 ① `command -v <cli>` 二进制 + ② `herdr integration status` 见 `current`;档案声明**无**钩子的后端(genox,见"后端档案")不要求 ②,改核"该槽位 pane 在场、pane 内进程存活、落盘 ACK 身份",**不得因缺 integration 就把 genox 槽位判成无解**。保留现行反例教训:仍禁"固定首选 + 贪心顺位下移"——只有 codex 与 kimi 可用时,合法解是 **kimi 审 + codex 干**;若按"审阅固定首选、只把执行顺位下移"的贪心,会误判成无解;
-- 候选健康检查与主后端同级(二进制 + integration `current` + 账号/模型可用性);枚举完仍无合法组队,**明确报告无法组队并停,不硬组**;
+- **组队用枚举,不用贪心**:对每个待填槽位给出候选池,枚举**全部组合**,取第一个满足 [能力覆盖 + 成对约束 + 候选健康检查 + 非同一 live agent] 的完整赋值。保留现行反例教训:仍禁"固定首选 + 贪心顺位下移"——只有 codex 与 kimi 可用时,合法解是 **kimi 审 + codex 干**;若按"审阅固定首选、只把执行顺位下移"的贪心,会误判成无解;
+- **健康检查分两个时点,别混着核**:
+  - **启动前(选人时)**:有钩子后端 = 二进制 + `herdr integration status` 见 `current` + 账号/模型可用性;无钩子后端(genox)= 二进制 + 账号/模型可用性(**不要求** integration `current`,也不许因此判无解)。这一档决定"这个候选能不能进组合";
+  - **启动后(拉起验收时)**:有钩子后端看 `agent start` 返回 ready + `agent get` 状态可读;无钩子后端看**该槽位 pane 在场、pane 内进程存活、落盘 ACK 身份**(pane 与 ACK 是拉起之后才有的东西,**选人阶段拿不到、也不该拿来卡组合**);
+- 候选健康检查与主后端同级(同一时点、同一套判据,不因为它是替补就放松);枚举完仍无合法组队,**明确报告无法组队并停,不硬组**;
 - **角色名不变,是槽位名不是后端名**:`rev-<tag>`/`exec-<tag>` 是槽位名(协议、看板、通信全部不动),实际后端与 kind 写进看板头;`--kind` 传实际后端(herdr 支持列表以 `herdr agent start --help` 为准);
-- 替补 CLI 的免确认参数各异、启动后验收模式:推广为**按后端档案逐 CLI 验收**(见"后端档案":每 CLI 一条,含两级健康检查、参数组、deny 挂载能力、状态钩子有无);
+- 替补 CLI 的免确认参数各异、启动后验收模式:推广为**按后端档案逐 CLI 验收**(见"后端档案":每 CLI 一条,含按档案分流的健康检查(启动前/启动后两时点)、参数组、deny 挂载能力、状态钩子有无);
 - **deny 清单挂载按 CLI 区分**:只有 claude 系有 `--settings` 挂 deny 清单的等价机制;**非 claude 执行槽位没有等价机制时,该槽位的无人值守能力随之一律停用**——该槽位改用有人在场参数组,或另配进程级沙箱;**不许"只把撤防记一笔"继续按无人值守跑**。
 
 ## 第 1 步:立看板
@@ -660,7 +912,7 @@ rmdir "$TD/launch.lock"                    # ACK 通过 = 拉起完成,释放排
 
 ## 后端档案(backend profile)
 
-> 每个后端 CLI 一条档案:**kind 名 / 两级健康检查 / 参数组(无人值守、有人在场) / deny 挂载能力 / 状态钩子有无 / 专属注记**。第 0 步"起代理循环"按槽位的 cli 来这里取参数;第 0 步"模式选择"按这里的两行表逐 CLI 取显式参数。**raw CLI 的 CLI 专属经验(如网络出口)记在这里,第 3 步正文只留通用规则。**
+> 每个后端 CLI 一条档案:**kind 名 / 健康检查(按状态钩子有无分流) / 参数组(无人值守、有人在场) / deny 挂载能力 / 状态钩子有无 / 专属注记**。第 0 步"起代理循环"按槽位的 cli 来这里取参数;第 0 步"模式选择"按这里的两行表逐 CLI 取显式参数。**raw CLI 的 CLI 专属经验(如网络出口)记在这里,第 3 步正文只留通用规则。**
 
 **参数组表(无人值守/有人在场 两行 × 每个档案化 CLI 一列)**:
 
@@ -674,7 +926,7 @@ rmdir "$TD/launch.lock"                    # ACK 通过 = 拉起完成,释放排
 | copilot / opencode / 其它替补 | 以该 CLI `--help` 实测为准(**逐 CLI 验收**,不套用上面的值) | 同左,显式人工档 | 无 | 补 `herdr integration install <agent>` 后有 |
 | **genox** | **无**(见下) | 交互式 `genox chat`(有人在场档为其唯一可用档) | **无** | **无**(herdr 无 genox kind/integration) |
 
-**两级健康检查(所有后端统一)**:① `command -v <cli>` 二进制在;② `herdr integration status` 显示 `current`。**无 kind 的后端(genox)②必然缺失**,按备胎处理:`agent get` 观测失效,只能 `pane read`。
+**健康检查(按档案的"状态钩子有无"分流,不搞一刀切)**:① `command -v <cli>` 二进制在——**所有后端**都要核;② `herdr integration status` 显示 `current`——**只有档案声明"有钩子"的后端**才核,**无 kind 的后端(genox)②必然缺失,不核也不补装**,按备胎处理:`agent get` 观测失效,只能 `pane read`。两档还各分两个时点(见"组队与替补"):**启动前**只核二进制与账号/模型可用性;**启动后**才核 pane 在场、pane 内进程存活、落盘 ACK 身份——选人阶段不该要求尚未存在的 pane/ACK。
 
 ### genox 条目
 
@@ -768,12 +1020,12 @@ rmdir "$TD/launch.lock"                    # ACK 通过 = 拉起完成,释放排
 
 分享/发布前逐项过。证据分四档,弃用笼统的 [已实测]:**[真实执行]** = 实际运行过命令/脚本,留有输入与结果路径;**[前缀建模]** = 只把命令串与规则清单/谓词做文本比对,没有真实运行;**[静态推演]** = 手工推理或一次性枚举,未固化成可重跑的记录;**[未实测]** = 尚未运行,只是规则要求。协议版本:**2026-10-10-r6**。
 
-> 行末带 **T001-d** 的,表示该行的探针由 T001-d 真跑;**本表只写要求,落证前不宣称已执行**——见到 T001-d 而 T001-d 尚未回执时,按 [未实测] 读。
+> 行末带 **T001-d** 的,表示该行的探针由 T001-d 真跑。**那是 3453b4a 上的历史证据**,只覆盖 T001-d 回执 §六自列的覆盖范围——其中 **r5 六样本口径只重放了 3 档**(realpath 判等、缺成员、退出码 3),**行 17 未做**(那段是带占位符的注释伪代码,不可机械抽取);它不自动证明当前 commit 的验收。本轮 T001-i 已在新 commit 上复跑同批样本并加严,证据在 `/tmp/genox/T001-i-evidence/`,两处冲突时以本轮为准。**本表只写要求,落证前不宣称已执行**——见到 T001-d 而 T001-d 尚未回执时,按 [未实测] 读。
 
 | # | 检查项 | 状态与证据 |
 |---|---|---|
-| 1 | 参数校验:**tag 照旧 8 例**;**roster 追加至少 6 例**:空串、含空格、含大写、含换行、非法槽位名、槽位重复、N=1、越界段数 —— 全拒;且**模型闸先于任何含 $tag/$roster 的命令** | **[真实执行] T001-d**(tag 的 8 例沿用 2026-10-09 证据 `/tmp/skillfix/r3-evidence/tag-validation.txt`,1 放行 7 拒绝;roster 的 ≥6 例与"模型闸先行"由 T001-d 真跑)。"展开值先经模型阅读判断"这条本身[未实测](需真调 Kimi 模板引擎喂非法 `$tag`/`$roster`) |
-| 2 | 同 tag 重入:**N ∈ {2,3,4} 各跑一组**复用检查;r5 的 6 样本口径(realpath 判等、缺拓扑 fail-closed、跨 tab、缺角色)逐样本重放到 N=2 与 N=4 | **[真实执行] T001-d**(r5 原证据 `/tmp/skillfix/r4-evidence/reuse-realpath.txt`;退出码口径不变:0 可复用 / 2 缺成员 / 3 fail-closed。N 泛化后的重放由 T001-d 真跑);**补建与失败回滚**[未实测] |
+| 1 | 参数校验:**tag 照旧 8 例**;**roster 追加至少 8 例**:含空格、含大写、含换行、非法槽位名、槽位重复、N=1、越界段数、空段/空值 —— **非法非空输入全拒**;**空串 = 按默认 roster 回落,不拒**;且**模型闸先于任何含 $tag/$roster 的命令** | **[真实执行] T001-d**(tag 的 8 例沿用 2026-10-09 证据 `/tmp/skillfix/r3-evidence/tag-validation.txt`,1 放行 7 拒绝)+ **T001-i 复跑**(空串回落样本 rc=0、其余非法非空样本 rc=1,见 `/tmp/genox/T001-i-evidence/` 的 roster 反例组)。"展开值先经模型阅读判断"这条本身[未实测](需真调 Kimi 模板引擎喂非法 `$tag`/`$roster`) |
+| 2 | 同 tag 重入:**N ∈ {2,3,4} 各跑一组**复用检查;r5 的 6 样本口径(realpath 判等、缺拓扑 fail-closed、跨 tab、缺角色)逐样本重放到 N=2 与 N=4;**pane 身份按 ID 唯一解析**(label/tab/workspace/pane cwd/进程 cwd/进程名逐项核)、**ACK 按已解析身份重建后全文比**、**身份不一致优先 rc=3 再算缺失**、**补缺只迭代缺失槽位** | **[真实执行] T001-i**(新 commit 上复跑 T001-d 同批样本 + 本轮加严反例:pane-id 不符 / pane cwd 不符 / 张冠李戴的同值 ACK / 空 ACK / 同槽位换后端 / 有成员错 cwd 且同时缺成员 → 全 rc=3;见 `/tmp/genox/T001-i-evidence/`);T001-d 历史覆盖见上注(**只重放 3 档**);**失败回滚**[未实测] |
 | 3 | 部分建队失败:进程未创建可同 pane 重发;进程在但 blocked/not-ready 先排障 | [未实测] |
 | 4 | 替补无解:枚举所有候选组合后才报无解 | **[真实执行]** 2026-10-09 脚本:审阅候选=[codex,kimi]、执行候选=[codex] 时,贪心误报无解、枚举得 kimi 审+codex 干(脚本与输出:`/tmp/skillfix/r3-evidence/role-pair-enum.txt`);**按槽位候选池 × 全组合**的泛化枚举实机演练[未实测] |
 | 5 | deny 负例(B1):`git push origin HEAD:main`、`git push origin --force` | **[真实执行]** 临时 Git 命令真跑:本地 bare remote 的 main 被实际改写(证据 `/tmp/skill-review/evidence.json`) |
@@ -781,16 +1033,19 @@ rmdir "$TD/launch.lock"                    # ACK 通过 = 拉起完成,释放排
 | 6 | deny 负例(N1):模板名 `.env.example` 不被任何 deny 规则命中(枚举危险形态,不靠白名单) | **[前缀建模]** 规则交集比对(fnmatch,2026-10-09);引擎内最终判定[未实测] |
 | 7 | 重启恢复:`/exit` → 提示符 → `herdr agent list` 核对旧名已释放 → 重拉(**无钩子成员改为 pane read 确认进程已退**) | [未实测] |
 | 8 | 模型参数:`-m <slug> -c model_reasoning_effort=high` 生效(状态栏两段 + 测试消息不弹 400) | 修复后生效待验[未实测];踩坑(整串当模型名 → 400)**[真实执行]** 2026-10-09 |
-| 9 | bootstrap:ACK 与 `/tmp/<TAG>/ack-expected` **全文全等(`cmp -s`)**才算"拉起完成"——矛盾字段、重复字段、多余行、缺行、行尾空格全拒;**N ∈ {2,3,4} 的判绿样本 + 每 N 的判红样本**;任务身份看 manifest,重入**唯一解析**:必需字段各恰好一行、值非空、同名字段两次即拒;manifest 唯一解析**在 roster 行上的对抗样本**:roster 缺行 / 重复行 / 与 cwd 槽位集合不符 / cwd 行数 ≠ N;**回放"旧 r5 解析器遇 roster 行必红"样本 ≥1** | **[真实执行] T001-d**(r5 的 8 样本口径沿用并扩 N:ACK 7 样本 `/tmp/skillfix/r4-evidence/cmp-ack.txt`、manifest 唯一解析 8 样本与目录安全 5 样本 `/tmp/skillfix/r5-evidence/manifest-unique-parse.txt`、`/tmp/skillfix/r5-evidence/dir-guard.txt`;N 泛化与 roster 行对抗样本由 T001-d 真跑);实机拉起 ACK[未实测] |
+| 9 | bootstrap:ACK 与 `/tmp/<TAG>/ack-expected` **全文全等(`cmp -s`)**才算"拉起完成"——矛盾字段、重复字段、多余行、缺行、行尾空格全拒;**N ∈ {2,3,4} 的判绿样本 + 每 N 的判红样本**;任务身份看 manifest,重入**唯一解析**:必需字段各恰好一行、值非空、同名字段两次即拒;**重入期望按已解析身份重建再全文比**;**manifest 对抗样本**:roster 缺行 / 重复行 / 与 cwd 槽位集合不符 / cwd 行数 ≠ N / 同槽位换后端 / 同槽位换模型 —— 全拒;**已证伪的旧断言不再回放**:r5 解析器**不检查** roster 行(`/tmp/genox/T001-d-evidence/` 的 R2b 原样 rc=0),不许再写成"必红";要红就用 cwd 行数 ≠ N 等**真会拒**的样本 | **[真实执行] T001-d**(ACK 7 样本 `/tmp/skillfix/r4-evidence/cmp-ack.txt`、manifest 唯一解析 8 样本与目录安全 5 样本 `/tmp/skillfix/r5-evidence/manifest-unique-parse.txt`)+ **T001-i 复跑并加严**(身份重建、同槽位换后端/换模型、cwd 行数等反例见 `/tmp/genox/T001-i-evidence/`);实机拉起 ACK[未实测] |
 | 10 | 派单状态语义:`done` 可收单;ACK 绑 task ID + 当次批次;`working` 不作判据;**无钩子成员的收单条件 = pane read 未见活动输出 + 上一单 ACK 已落盘** | [未实测] |
 | 11 | 模式选择:三闸证据落 `/tmp/<TAG>/mode-selection.md` → 全过用无人值守参数组,任一不过用有人在场参数组(不对执行槽发 bypass/auto;**有人在场按各 CLI 档案显式给出**——claude 显式 `--permission-mode default`、codex 显式 `-a on-request -c approvals_reviewer=user`,都不接受继承本机未审默认) | **[静态推演]** 两参数组按闸结果二选一为人工推演;参数组表按 CLI 展开为人工推演;实机按两模式各拉起一次[未实测] |
 | 12 | claude 有效规则**效果检查**:`/status`(`/permissions`)看 settings sources 与生效规则,条目贴看板;验不到 → 退回有人在场并**先停再按显式人工模式重拉重验**;启动后验收真实模式(`pane read`/`/status`),验不出人工模式 = 闸失败停止派单 | [未实测](第 6 行的规则交集比对是[前缀建模],不等于引擎内生效) |
 | 13 | 参数组为 bash 数组、`"${ARR[@]}"` 逐项成 argv:含空格路径不被拆、Zsh 标量不分词问题不复现;空参数组 `=()` 展开为空 | **[真实执行]** 2026-10-09:bash 5.2.21 与 zsh 5.9 × 两模式 × 两路径(含 `/tmp/skill space`)共 8 样本——数组形式两边都逐项正确;旧标量串在 bash 空格路径被拆成两项、在 zsh 整组变成一个参数(证据 `/tmp/skillfix/r4-evidence/argv-arrays.txt`) |
 | 14 | 有人在场落地:按各 CLI 档案显式给出人工档 **且**启动后验到真实人工模式才恢复派单;codex 显式审批策略/审批者并 `pane read` 核对显示(`on-request` 只保证"请求时才问",不等于每条命令都问人);既有会话不适用启动参数、先停再拉;orch rename 例外收窄为"模式验收已过 或 用户把授权范围落盘 `mode-selection.md`"(`--auto`=Never Ask,在场≠用户批准) | [未实测](文档依据:claude `v2.1.283` 起不传 bypass 也可能继承 auto 或用户 `defaultMode`;本机 codex 用户 config `approval_policy = "never"` 为只读窄读) |
-| 15 | **先分类后取锁**(N3):空目录 → 分类"新建" → 取锁 → 建 manifest → ACK 全等 → 释放的完整链;**用 N=4 roster 整段抽跑**;残留目录(非空无 manifest)在取锁前被拒;同 TAG 并发抢锁被拒;全程不许删锁换绿 | **[真实执行] T001-d**(r5 原证据:`/tmp/skillfix/r5-evidence/lock-flow.txt`,4 分支 + 闸的顺序探针;N=4 roster 的整段抽跑由 T001-d 真跑);真代理拉起[未实测] |
-| 16 | **成对约束校验器**:判绿 = 现行默认 trio;判红 = 同 CLI 对、跨 CLI 同 family 对;**报错措辞与 SKILL 写死文本一致**;闸脚本自证能红能绿 | **[真实执行] T001-d**(每类 ≥1 样本) |
+| 15 | **先分类后取锁**(N3):空目录 → 分类"新建" → 取锁 → 建 manifest → ACK 全等 → 释放的完整链;**用 N=4 roster 整段抽跑**;残留目录(非空无 manifest)在取锁前被拒;同 TAG 并发抢锁被拒;**先分类后算路径:方案在新建时冻结进 manifest,重入只恢复不重推**(main-only 建好后再 `git init` 也必须仍按冻结方案) | **[真实执行] T001-d**(r5 原证据:`/tmp/skillfix/r5-evidence/lock-flow.txt`,4 分支 + 闸的顺序探针)+ **T001-i**(N=4 整段抽跑 + "main-only 建后 git init 再重入"样本判绿,见 `/tmp/genox/T001-i-evidence/`);真代理拉起[未实测] |
+| 16 | **成对约束校验器**:判绿 = 现行默认 trio;判红 = 同 CLI 对、跨 CLI 同 family 对;**报错措辞与 SKILL 写死文本一致**;闸脚本自证能红能绿 | **[真实执行] T001-d**(每类 ≥1 样本)+ **T001-i**(同一套闸脚本复跑,默认 trio 与两类同源反例仍判红;orch=genox 亦拒) |
 | 17 | **布局与命名**:N=2/3/4 的 pane 裂序(right→down 循环)与 rename 循环静态推演 + **N=3 与 r5 布局逐 pane 一致性核对** | **[静态推演]** + 真机拉起[未实测] |
 | 18 | **genox 槽位拉起**:启动命令真跑;免确认路径按 `/tmp/genox/T001-b-result.md` 回填;验证"有人在场 + pane 发指针 + 落盘 ACK"闭环可用桩对端跑通 | **[真实执行] T001-d**(依赖 T001-b);T001-b 已落证部分见"后端档案"genox 条;**端到端无人值守跑通仍 [未实测]**(本机无外网) |
+| 19 | **落盘快照的写入边界**:agent-list / pane-list / pane-info-\<slot\> / missing-slots 落盘前逐条核(拒符号链接、核属主、核在任务目录内);任务目录外放哨兵文件,负例跑完哨兵必须原样 | **[真实执行] T001-i**(符号链接负例:写前拒、外部 sentinel 字节不变;见 `/tmp/genox/T001-i-evidence/`) |
+| 20 | **逐槽位模型/推理档**:同一 CLI 的两个槽位各按自己的 roster 声明合成 argv(同 CLI 不同 model/effort 不互相顶掉);声明了模型/推理档却无对应 flag 的字段**明确拒绝**,不静默丢弃;`orch` 必须是 kimi | **[真实执行] T001-i**(同 CLI 双槽位 argv 反例 + orch=genox 拒;见 `/tmp/genox/T001-i-evidence/`) |
+| 21 | **重组=显式换任务身份**:重入且本次真起了代理 → manifest 的 bootstrap-id 行原子改写为新号 → ACK 期望按新号重建 → 旧 ACK 随即作废;一个都没起(全可复用)时沿用原号、不重发 bootstrap | **[真实执行] T001-i**(换号后旧 ACK 判红、新 ACK 判绿;见 `/tmp/genox/T001-i-evidence/`) |
 
 ## 附录:原作者经验(不是通用事实,按自己的环境验证)
 

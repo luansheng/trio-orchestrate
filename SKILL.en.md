@@ -123,28 +123,42 @@ ROSTER=$roster                     # second parameter; if empty → use the defa
 # The regex rejects empty members (two `+` in a row), empty segments (nothing after `=`), `::`, uppercase, spaces and newlines; at most 4 segments per member (slot=cli:model:effort:family)
 
 # ── roster structural validation (after parsing, one python step, stop on failure) ──
-# In order: ① slot name ∈ vocabulary, no duplicates within one roster; ② N ≥ 2; ③ capability coverage orch≥1/rev≥1/exec≥1;
-# ④ exactly one orchestrator (orch exactly 1); ⑤ pairwise constraint enumeration (rev capability × exec capability, not same-origin);
-# ⑥ every member's full name matches ^[a-z0-9_-]{1,32}$ and is ≤32; ⑦ cli ∈ this machine's backend-profile table (see "Backend profiles";
-# an unknown CLI → "no profile, add a backend profile before launching").
+# In order: ① slot name ∈ vocabulary, no duplicates within one roster, ≤5 segments and no empty segment; ② N ≥ 2; ③ capability coverage orch≥1/rev≥1/exec≥1;
+# ④ exactly one orchestrator (orch exactly 1) **and its CLI must be kimi** (the skill itself runs inside kimi; a hookless backend such as genox must never hold orch);
+# ⑤ pairwise constraint enumeration (rev capability × exec capability, not same-origin); ⑥ every member's full name matches ^[a-z0-9_-]{1,32}$ and is ≤32;
+# ⑦ cli ∈ this machine's backend-profile table (see "Backend profiles"; an unknown CLI → "no profile, add a backend profile before launching");
+# ⑧ a declared model/effort must have a matching launch flag in that CLI's profile (a field with no flag is refused **by name**, never silently dropped — see "Backend profiles", the flag-composition table).
 # On success it prints the normalized roster string (slot order fixed: orch always first, the rest in declaration order), which is
 # written into the manifest's roster: line and into the bootstrap, so the expected set can be rebuilt on re-entry.
-ROSTER_NORM=$(python3 - "$ROSTER" "$TAG" <<'PY'
+# This is the **single** copy of the roster validation/normalizing source (the DSL below): besides this run's argument, the
+# roster: line read back from the manifest on re-entry is re-validated by the same source and compared by full value
+# (backend/model/effort/family), so the two sides' rules cannot drift apart.
+ROSTER_DSL=$(cat <<'PY'
 import re, sys
 CAPS = {"orch": {"orch"}, "rev": {"rev"}, "rev2": {"rev"}, "revtest": {"rev", "exec"}, "exec": {"exec"}}
 for _i in range(2, 10):
-    CAPS[f"exec{_i}"] = {"exec"}                       # exec2…exec9: ten additional execution lines
-KNOWN_CLI = {"kimi", "codex", "claude", "copilot", "opencode", "genox"}   # this machine's backend-profile table; keep in sync when adding profiles
+    CAPS[f"exec{_i}"] = {"exec"}                       # exec2…exec9 十个扩展执行线
+KNOWN_CLI = {"kimi", "codex", "claude", "copilot", "opencode", "genox"}   # 本机后端档案表;扩充档案时同步这里
+CLI_FIELDS = {                                          # 各 CLI 档案里**有**对应启动 flag 的字段(实测,见"后端档案"参数合成表):
+    "kimi": {"model"},                                  # 没列出的字段=该后端不支持,声明即拒,不静默丢弃
+    "codex": {"model", "effort"},                       # codex: -m <model> -c model_reasoning_effort=<effort>
+    "claude": {"model", "effort"},                      # claude: --model <model> --effort <level>
+}
 roster, tag = sys.argv[1], sys.argv[2]
 full = re.compile(r"^[a-z0-9_-]{1,32}$")
 members = []
 for part in roster.split("+"):
-    seg = part.replace("=", ":", 1).split(":")      # split the `=` once first (seg[0] held the whole `slot=cli` string, not the slot), then split on `:`
+    seg = part.replace("=", ":", 1).split(":")      # 先拆一次 `=`(seg[0] 里装的是 `slot=cli` 整串,不是 slot),再按 `:` 分段
+    if len(seg) > 5:                                # 段数上限 slot=cli:model:effort:family;多出的段非法,不静默丢弃
+        sys.exit(f"成员段数越界:{part!r}(最多 slot=cli:model:effort:family 五段)")
     slot, cli = seg[0], seg[1]
     model = seg[2] if len(seg) > 2 else ""
     effort = seg[3] if len(seg) > 3 else ""
-    family = seg[4] if len(seg) > 4 else model      # family defaults to the model string
-    if slot not in CAPS:                            # unknown slot: refuse by name (Chinese message, instead of letting a KeyError traceback surface)
+    family = seg[4] if len(seg) > 4 else model      # family 缺省 = model 原串
+    for _x in seg[2:]:                              # 空段(如 `::`、尾随 `:`)是非法声明,不当"未声明该字段"放过
+        if not _x:
+            sys.exit(f"成员段为空:{part!r}(空段非法;不声明就整段不写)")
+    if slot not in CAPS:                            # 未知槽位:点名拒绝(中文报错,不让 KeyError 栈回溯冒出来)
         sys.exit(f"未知槽位名 {slot!r}:槽位取自封闭词表 orch/rev/rev2/revtest/exec/exec2…exec9")
     members.append(dict(slot=slot, cli=cli, model=model, effort=effort, family=family, caps=CAPS[slot]))
 # ① no duplicate slots
@@ -154,14 +168,17 @@ if len(set(slots)) != len(slots):
 # ② N ≥ 2
 if len(members) < 2:
     sys.exit(f"编队至少 2 名成员(实得 {len(members)})")
-# ③ capability coverage
+# ③ 能力覆盖
 for cap in ("orch", "rev", "exec"):
     if not any(cap in m["caps"] for m in members):
         sys.exit(f"编队缺少 {cap} 能力:每个 roster 必须有 orch ≥1、rev ≥1、exec ≥1")
-# ④ exactly one orchestrator
-if sum(1 for m in members if "orch" in m["caps"]) != 1:
+# ④ exactly one orchestrator + the orch backend restriction
+_oslots = [m for m in members if "orch" in m["caps"]]
+if len(_oslots) != 1:
     sys.exit("必须单编排:orch 槽位恰好一个")
-# ⑤ pairwise constraint: rev capability × exec capability must not be same-origin (a composite slot's self-pairing is skipped, see "self-review invalid")
+if _oslots[0]["cli"] != "kimi":
+    sys.exit(f"orch 槽位的 CLI 必须是 kimi(实得 {_oslots[0]['cli']}):技能就跑在 kimi 里,无钩子后端不得承担 orch(见\"组队与替补\")")
+# ⑤ 成对约束:rev 能力 × exec 能力 不得同源(复合槽位自配对跳过,走"自审无效"条款)
 revs = [m for m in members if "rev" in m["caps"]]
 execs = [m for m in members if "exec" in m["caps"]]
 for i in revs:
@@ -174,15 +191,22 @@ for i in revs:
                 f"组队冲突:槽位 {i['slot']}({i['cli']}/{i['model']}) 与槽位 "
                 f"{j['slot']}({j['cli']}/{j['model']}) 同源(共享 {shared}):审了等于没审。"
                 f"请更换其中一端的 CLI 或模型族,或在声明中给两端标注不同 family。")
-# ⑥ full-name length and character set
+# ⑥ 全名长度与字符集
 for m in members:
     name = f"{m['slot']}-{tag}"
     if len(name) > 32 or not full.match(name):
         sys.exit(f"agent 全名不合法或超 32:{name}")
-# ⑦ CLI has a profile
+# ⑦ CLI 有档案
 for m in members:
     if m["cli"] not in KNOWN_CLI:
         sys.exit(f"CLI {m['cli']} 无档案,先补后端档案再拉起")
+# ⑧ 逐槽位字段能力:后端档案没有对应 flag 的字段,声明即拒(不静默忽略)
+for m in members:
+    _allow = CLI_FIELDS.get(m["cli"], set())
+    for _f in ("model", "effort"):
+        if m[_f] and _f not in _allow:
+            sys.exit(f"槽位 {m['slot']}({m['cli']})不支持 {_f} 声明 {m[_f]!r}:该后端档案里没有对应启动参数,"
+                     f"声明即拒、不静默丢弃(见\"后端档案\"参数合成表);删掉该字段或换后端")
 order = {"orch": 0}
 members.sort(key=lambda m: (order.get(m["slot"], 1), slots.index(m["slot"])))
 out = []
@@ -195,9 +219,12 @@ for m in members:
             if m["family"] and m["family"] != m["model"]:
                 seg.append(m["family"])
     out.append(":".join(seg))
-print("+".join(out))                                # stdout prints exactly one line: the normalized roster string
+print("+".join(out))                                # stdout 只出一行规范化 roster 串
 PY
+)
+ROSTER_NORM=$(python3 -c "$ROSTER_DSL" "$ROSTER" "$TAG"
 ) || { echo "roster structural validation failed: stop, fix per the error above, then launch"; exit 1; }
+export ROSTER_DSL ROSTER_NORM                       # the validator source and the canonical roster travel through the environment to the later parsers (the manifest's roster: line is re-validated by the very same source)
 echo "normalized roster: $ROSTER_NORM"
 
 # ── Task directory: classify before taking the lock, fix the path plan first; never overwrite unconditionally ──
@@ -212,15 +239,27 @@ echo "normalized roster: $ROSTER_NORM"
 TD="/tmp/$TAG"                                          # task directory (state directory); this block always uses $TD
 mkdir -p "$TD"                                          # idempotent
 
-# Directory/file safety: check every path read or written — not a symlink (`[ -L ]`), owned by yourself; a non-existent path counts as creatable
+# Directory/file safety: check every path read or written — not a symlink (`[ -L ]`), owned by yourself; a non-existent path counts as creatable;
+# after normalization it must also stay inside the task directory (a path crossing the boundary is refused up front, before anything is written)
 guard() {
   [ -e "$1" ] || [ -L "$1" ] || return 0
   [ -L "$1" ] && { echo "reject: $1 is a symlink (it may point outside the task directory)"; return 1; }
   [ "$(stat -c %u -- "$1" 2>/dev/null)" = "$(id -u)" ] || { echo "reject: $1 is not owned by the current user"; return 1; }
   return 0
 }
-for p in "$TD" "$TD/manifest.txt" "$TD/taskboard.md" "$TD/bootstrap.md" "$TD/bootstrap-ack.md" "$TD/ack-expected" "$TD/mode-selection.md" "$TD/panes.txt"; do
-  guard "$p" || { echo "task directory/file safety check failed: stop for manual confirmation"; exit 1; }
+TD_REAL=$(realpath -m "$TD")
+guard_td() {                                            # guard + task-directory boundary: after normalization it must equal $TD or sit under it
+  guard "$1" || return 1
+  case "$(realpath -m "$1")" in
+    "$TD_REAL"|"$TD_REAL"/*) return 0 ;;
+    *) echo "reject: $1 normalizes outside the task directory $TD_REAL"; return 1 ;;
+  esac
+}
+# The static list carries this round's new on-disk JSON snapshots (agent-list / pane-list) and the missing list (missing-slots.txt): they too must
+# refuse symlinks, have their owner checked and respect the boundary — "it is a herdr output redirect" or "the reuse check writes it itself" is no excuse
+# (2026-10-10 re-review: a symlink pass-through overwrites files outside the task directory)
+for p in "$TD" "$TD/manifest.txt" "$TD/taskboard.md" "$TD/bootstrap.md" "$TD/bootstrap-ack.md" "$TD/ack-expected" "$TD/mode-selection.md" "$TD/panes.txt" "$TD/agent-list.json" "$TD/pane-list.json" "$TD/missing-slots.txt"; do
+  guard_td "$p" || { echo "task directory/file safety check failed: stop for manual confirmation"; exit 1; }
 done
 
 ROOT=$(realpath -m "$PWD")                              # canonical absolute project root: the anchor of task identity
@@ -230,11 +269,14 @@ SLOTS=$(python3 -c 'import sys;print(" ".join(p.split("=")[0].split(":")[0] for 
 N=$(echo $SLOTS | wc -w)
 SLOT_ARR=($SLOTS)                                       # slots in fixed order, indexable (slot names are [a-z0-9_] only, so word splitting is safe)
 declare -A CLI_OF                                       # slot → backend CLI: the start loop branches on the CLI (hookless backends start via the pane)
-while read -r _s _c; do CLI_OF[$_s]=$_c; done < <(python3 - "$ROSTER_NORM" <<'PY'
+declare -A MODEL_OF EFFORT_OF                           # slot → declared model / effort: the per-slot argv is composed from these two tables (no longer one shared set per CLI)
+while read -r _s _c _m _e; do CLI_OF[$_s]=$_c; MODEL_OF[$_s]=$_m; EFFORT_OF[$_s]=$_e; done < <(python3 - "$ROSTER_NORM" <<'PY'
 import sys
 for part in sys.argv[1].split("+"):
     seg = part.replace("=", ":", 1).split(":")
-    print(seg[0], seg[1])
+    model = seg[2] if len(seg) > 2 else ""
+    effort = seg[3] if len(seg) > 3 else ""
+    print(seg[0], seg[1], model, effort)
 PY
 )
 declare -A EXPECT_OF                                    # slot → expected cwd: both the new and the re-entry path must fill it; the reuse check and the split loop always read it here
@@ -244,26 +286,24 @@ for s in $SLOTS; do
   case " $NO_HOOK_CLI " in *" ${CLI_OF[$s]} "*) HOOKLESS="$HOOKLESS $s=${CLI_OF[$s]}";; esac
 done
 HOOKLESS=${HOOKLESS# }                                  # hookless slots (fixed slot order), each recorded as <slot>=<cli>: the reuse check needs that slot's CLI name to match the pane's foreground process name, so the slot name alone is not enough
-# The path plan is fixed before the manifest is generated (not "compute sibling worktrees first, then reject the non-git fallback
-# the document allows"):
-#   git repo → the orch slot's cwd = the main tree, and every non-orch slot gets a sibling worktree; non-git → all N cwds record
-#   the main tree (allowed only in attended mode)
-if git -C "$PWD" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
-  PATH_PLAN=worktree
-else
-  PATH_PLAN=main-only
-fi
-# Per-slot expected path: under the git plan orch = the main tree and the rest = ../wt-$TAG-<slot>; under the non-git plan all = the main tree
+# A hookless slot's pane-evidence JSON (pane-info-<slot>.json) is named per slot: add each to the safety check (again refused before anything is written)
+for _hs in $HOOKLESS; do
+  guard_td "$TD/pane-info-${_hs%%=*}.json" || { echo "task directory/file safety check failed (hookless slot pane evidence): stop for manual confirmation"; exit 1; }
+done
+
+# Only two candidate formulas are prepared up front for the path plan (both are pure functions of $PWD/$TAG/slot, neither consults git):
+# under the worktree plan orch = the main tree and the rest = ../wt-$TAG-<slot>; under main-only all = the main tree.
+# **Which plan is used is fixed only inside the "new" branch, from the git state at that moment**;
+# a re-entry always restores it from the frozen manifest and never looks at the current git state (classify first, compute paths second)
 EXPECT_MAIN=$(realpath -m "$PWD")
-expect_of() {                                            # $1 = slot
-  if [ "$PATH_PLAN" = worktree ] && [ "$1" != orch ]; then
-    realpath -m "$PWD/../wt-$TAG-$1"
-  else
-    echo "$EXPECT_MAIN"
-  fi
+expect_wt_of() {                                        # worktree plan: the orch slot is in the main tree, the rest in sibling worktrees
+  if [ "$1" = orch ]; then echo "$EXPECT_MAIN"; else realpath -m "$PWD/../wt-$TAG-$1"; fi
+}
+expect_of() {                                           # take that slot's expected path under the fixed/restored $PATH_PLAN
+  if [ "$PATH_PLAN" = worktree ]; then expect_wt_of "$1"; else echo "$EXPECT_MAIN"; fi
 }
 
-# ① Classify: a read-only judgement, writing nothing yet
+# ① Classify: a read-only judgement, writing nothing yet (classify first, paths second: a main-only task created before `git init` stays main-only on re-entry)
 if [ -s "$TD/manifest.txt" ]; then
   CLASSIFY=reentry
 elif [ -n "$(ls -A "$TD" 2>/dev/null)" ]; then
@@ -279,24 +319,52 @@ if [ "$CLASSIFY" = reentry ]; then
   # Re-entry: the manifest **unique parse** — required fields (tag / roster / project-root / created / bootstrap-id)
   # each exactly one line with a non-empty value; a field name appearing twice is a rejection (contradictory values do not count
   # as "consistent field by field");
-  # cwd line count == N, the cwd slot set == the roster line's slot set, and a per-slot realpath comparison.
-  # N is read from the roster line (no second parse in shell); the expected paths are computed per slot by this process from the
-  # path plan and passed in, and both sides are normalized with realpath before comparing. stdout emits exactly N verified paths
-  # in fixed slot order, for the shell to read back line by line.
-  _eargs=()                                             # slot/expected-path pairs go in as a **referenced array**: a path containing spaces stays one argv, never split
-  for s in $SLOTS; do _eargs+=("$s" "$(expect_of "$s")"); done
-  _mout=$(python3 - "$TAG" "$ROOT" "$TD/manifest.txt" "$SLOTS" "${_eargs[@]}" <<'PY'
-import os, sys
-tag, root, path = sys.argv[1:4]
+  # the roster line first goes through the **same DSL source** (tabulated against ROSTER_DSL/ROSTER_NORM from the environment, compared by full value:
+  # backend/model/effort/family all included — the same slot set with a swapped backend or model is still a rejection);
+  # cwd line count == N, the cwd slot set == the roster line's slot set, and a per-slot realpath comparison against the **frozen plan**.
+  # The frozen plan = the one fixed at creation time, recovered on re-entry from the manifest's set of cwd lines (both candidate
+  # formulas — worktree / main-only — are passed in by the shell as **pure functions**, consulting no current git state): the cwd
+  # lines must fall as a whole inside exactly one of them; the plan is never re-derived.
+  # stdout emits N verified paths (fixed slot order) + a bootstrap-id line + a path-plan line, for the shell to read back line by line.
+  _eargs=()                                             # plan name and slot/expected-path pairs go in as a **referenced array**: a path containing spaces stays one argv, never split
+  for _pl in worktree main-only; do                     # one group per candidate plan: chosen at creation, claimed from the cwd lines on re-entry
+    _eargs+=("$_pl")
+    for s in $SLOTS; do
+      if [ "$_pl" = worktree ]; then _eargs+=("$s" "$(expect_wt_of "$s")"); else _eargs+=("$s" "$EXPECT_MAIN"); fi
+    done
+  done
+  _mout=$(python3 - "$TAG" "$ROOT" "$TD/manifest.txt" "$SLOTS" "$ROSTER_NORM" "${_eargs[@]}" <<'PY'
+import os, sys, subprocess
+tag, root, path, rnorm = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[5]   # this run's full canonical roster is an **explicit argument** (no longer just the slot table)
 slots = sys.argv[4].split()                             # $SLOTS arrives as a space-separated **string**: it must be split into a list, or list-vs-string never compares equal
-rest = sys.argv[5:]
+rest = sys.argv[6:]
 if not slots or len(set(slots)) != len(slots):
     sys.exit(f"槽位表非法(为空或有重复):{slots}")
-if len(rest) != 2 * len(slots):
-    sys.exit(f"槽位与预期路径不是成对的 N 组:槽位 {len(slots)} 个、参数 {len(rest)} 项")
-want = dict(zip(rest[0::2], rest[1::2]))
-if set(want) != set(slots) or any(not p for p in want.values()):
-    sys.exit("槽位→预期路径映射不完整或含空值")
+dsl = os.environ.get("ROSTER_DSL", "")
+if not dsl or not rnorm:
+    sys.exit("环境里没有本次的 roster 校验器源码(ROSTER_DSL)/规范 roster 入参:fail-closed,不识别本任务")
+def canon(rs):                                          # validate + normalize with the **same** DSL source; anything that fails stops right here
+    r = subprocess.run([sys.executable, "-c", dsl, rs, tag], capture_output=True, text=True)
+    if r.returncode != 0:
+        sys.exit("roster 未过 DSL 校验:" + (r.stderr.strip() or r.stdout.strip()))
+    return r.stdout.strip()
+if canon(rnorm) != rnorm:
+    sys.exit("本次规范 roster 入参不是规范形:fail-closed")
+stride = 1 + 2 * len(slots)
+if not rest or len(rest) % stride:
+    sys.exit(f"路径方案组不是整组 N 对:槽位 {len(slots)} 个、参数 {len(rest)} 项")
+groups = {}
+for off in range(0, len(rest), stride):
+    grp = rest[off:off + stride]
+    plan, pairs = grp[0], grp[1:]
+    if plan not in ("worktree", "main-only") or plan in groups:
+        sys.exit(f"路径方案组名非法或重复:{plan!r}")
+    want = dict(zip(pairs[0::2], pairs[1::2]))
+    if set(want) != set(slots) or any(not p for p in want.values()):
+        sys.exit(f"方案 {plan} 的槽位→预期路径映射不完整或含空值")
+    groups[plan] = want
+if set(groups) != {"worktree", "main-only"}:
+    sys.exit(f"缺少路径方案组:实得 {sorted(groups)}")
 seen = {}
 for line in open(path, encoding="utf-8"):
     line = line.rstrip("\n")
@@ -315,12 +383,11 @@ def one(k):                                             # a required field is ex
     return vs[0]
 if one("tag") != tag: sys.exit("tag 不符")
 if one("project-root") != root: sys.exit("project-root 不符")
-one("created"); one("bootstrap-id")                     # present, exactly one line, non-empty value
+one("created")                                          # present, exactly one line, non-empty value
+task_id = one("bootstrap-id")                           # task identity number: the sole basis for rebuilding the expected ACK
 roster = one("roster")                                  # the roster line: required, exactly one line, non-empty
-rslots = [p.split("=")[0].split(":")[0] for p in roster.split("+")]
-if rslots[0] != "orch": sys.exit(f"roster 行槽位序不合法(orch 必须第一):{roster!r}")
-if rslots != slots:
-    sys.exit(f"roster 行槽位集合与本次不符:{rslots} ≠ {slots}")
+if canon(roster) != rnorm:
+    sys.exit(f"manifest 的 roster 行与本次规范 roster 不同:{canon(roster)!r} ≠ {rnorm!r}(换了后端/模型/推理档/family 都算不同)")
 cwds = seen.get("cwd", [])
 if len(cwds) != len(slots):
     sys.exit(f"cwd 行数应 == N = {len(slots)}(实得 {len(cwds)})")
@@ -336,31 +403,59 @@ for v in cwds:
     got[slot] = p.strip()
 if set(got) != set(slots): sys.exit("cwd 槽位集合与 roster 行不符")
 if [k for k in got] != slots: sys.exit("cwd 行序与槽位固定序不符")
-for name in slots:
-    if os.path.realpath(got[name]) != os.path.realpath(want[name]):
-        sys.exit(f"{name} cwd={got[name]} ≠ 预期 {want[name]}(realpath 规范化后仍不同)")
-print("manifest 唯一解析通过:字段无重复、值非空,roster 行与 N 个槽位 cwd 与本次一致", file=sys.stderr)
+def mism(plan):                                         # per-slot detail of what does not match under that plan
+    return ", ".join(f"{s} cwd={got[s]} ≠ 方案预期 {groups[plan][s]}"
+                     for s in slots if os.path.realpath(got[s]) != os.path.realpath(groups[plan][s]))
+matched = [pl for pl in ("worktree", "main-only") if not mism(pl)]
+if len(matched) != 1:                                   # 0 = belongs to no frozen plan; 2 = ambiguous; both fail closed
+    sys.exit("cwd 行不落在唯一的冻结路径方案里(" + ("; ".join(mism(pl) for pl in ("worktree", "main-only")) if not matched
+             else "两个方案同时成立,方案歧义") + ")")
+print(f"manifest 唯一解析通过:字段无重复、值非空;roster 行过同一 DSL 且与本次全值一致;cwd 行属冻结方案 {matched[0]}", file=sys.stderr)
 for name in slots:
     print(got[name])                                    # stdout emits exactly N verified paths (fixed slot order), for the shell to read back
+print("bootstrap-id: " + task_id)                       # task identity number: the reuse check rebuilds the expected ACK from it
+print("path-plan: " + matched[0])                       # the frozen plan: a re-entry never re-derives it from the current git state
 PY
-  ) || { echo "manifest does not match this run (duplicate field/empty value/project root/roster/slot path/missing path): not recognized as this task, stop for manual confirmation"; exit 1; }
-  # The expected cwds were verified by the same parser with the same algorithm above (re-entry does not re-assemble the path plan
-  # and does not parse a second time — the awk second parse once drifted from the manifest line format, blanking all three EXPECT
-  # values, 2026-10-09 N4); read them back line by line with r5's `IFS= read -r`, **no `eval`**: a path is data, not shell source
-  # (it may contain spaces, backslashes, a literal $()), and read-back must place it into the array untouched; guard against empty
-  # values and against too many/too few lines
-  i=0
+  ) || { echo "manifest does not match this run (duplicate field/empty value/project root/roster full value/frozen-plan path/missing path): not recognized as this task, stop for manual confirmation"; exit 1; }
+  # The expected cwds were verified by the same parser with the same algorithm above (re-entry neither re-assembles the plan from the
+  # current git state nor parses a second time — the awk second parse once drifted from the manifest line format, blanking all three
+  # EXPECT values, 2026-10-09 N4); read them back line by line with r5's `IFS= read -r`, **no `eval`**: a path is data, not shell
+  # source (it may contain spaces, backslashes, a literal $()), and read-back must place it into the array untouched; guard against
+  # empty values and against too many/too few lines
+  i=0; TASK_ID=""; PLAN_IN=""
   while IFS= read -r _line; do
-    [ -n "$_line" ] || { echo "the re-entry read-back expected cwd is empty (line $((i+1))): stop for manual confirmation"; exit 1; }
-    [ "$i" -lt "$N" ] || { echo "re-entry read back more paths than N=$N: stop for manual confirmation"; exit 1; }
-    EXPECT_OF[${SLOT_ARR[$i]}]=$_line                   # placed line by line in fixed slot order (the generalization of r5's three EXPECT_* variables)
+    if [ "$i" -lt "$N" ]; then
+      [ -n "$_line" ] || { echo "the re-entry read-back slot cwd is empty (line $((i+1))): stop for manual confirmation"; exit 1; }
+      EXPECT_OF[${SLOT_ARR[$i]}]=$_line                 # placed line by line in fixed slot order (the generalization of r5's three EXPECT_* variables)
+    else
+      case "$_line" in
+        "bootstrap-id: "*) [ -z "$TASK_ID" ] || { echo "re-entry read back a duplicate bootstrap-id line: stop for manual confirmation"; exit 1; }
+                           TASK_ID=${_line#bootstrap-id: } ;;
+        "path-plan: "*)    [ -z "$PLAN_IN" ] || { echo "re-entry read back a duplicate path-plan line: stop for manual confirmation"; exit 1; }
+                           PLAN_IN=${_line#path-plan: } ;;
+        *) echo "re-entry read back an unexpected line: $_line (fail-closed)"; exit 1 ;;
+      esac
+    fi
     i=$((i+1))
   done <<< "$_mout"
-  [ "$i" = "$N" ] || { echo "re-entry read back $i paths, expected $N: stop for manual confirmation"; exit 1; }
-  EXPECT_MAIN=${EXPECT_OF[orch]}                        # the orch slot's cwd is the main tree path (under the non-git plan every slot is it)
-  echo "re-entry: manifest unique parse consistent, reusing the existing taskboard, filling gaps only, never overwriting"
+  [ "$i" = "$((N + 2))" ] || { echo "re-entry read back $i lines, expected $((N + 2)) (N paths + bootstrap-id + path-plan): stop for manual confirmation"; exit 1; }
+  [ -n "$TASK_ID" ] || { echo "the re-entry read-back bootstrap-id is empty: fail-closed"; exit 1; }
+  case "$PLAN_IN" in
+    worktree|main-only) PATH_PLAN=$PLAN_IN ;;
+    *) echo "the re-entry read-back path plan is illegal: $PLAN_IN (fail-closed)"; exit 1 ;;
+  esac
+  EXPECT_MAIN=${EXPECT_OF[orch]}                        # the orch slot's cwd is the main tree path (under the main-only plan every slot is it)
+  echo "re-entry: manifest unique parse consistent (roster full value matches, cwd lines belong to the frozen plan $PATH_PLAN); reusing the existing taskboard, filling gaps only, never overwriting"
 else
-  CREATE_ID=$(date +%s)-$RANDOM                         # directory creation batch id: part of task identity, taken only on a new launch
+  # The path plan is fixed only inside the **new** branch, from the current git state; a re-entry always restores the frozen plan above
+  # (classify first, paths second: a main-only task created before `git init` stays main-only on re-entry, it is not re-judged because the tree is now a repo)
+  #   git repo → the orch slot's cwd = the main tree, and every non-orch slot gets a sibling worktree; non-git → all N cwds record the main tree (allowed only in attended mode)
+  if git -C "$PWD" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+    PATH_PLAN=worktree
+  else
+    PATH_PLAN=main-only
+  fi
+  CREATE_ID=$(date +%s)-$RANDOM                         # task identity number: taken only on a new launch, written into the manifest; the ACK expectation uses it too
   {
     echo "tag: $TAG"
     echo "roster: $ROSTER_NORM"
@@ -371,32 +466,41 @@ else
     echo "created: $(date -Is)"
     echo "bootstrap-id: $CREATE_ID"
   } > "$TD/manifest.txt"
-  for s in $SLOTS; do EXPECT_OF[$s]=$(expect_of "$s"); done   # same as the re-entry branch: the new-launch branch must fill the per-slot
-                                                              # expected cwds too (r5 kept the three EXPECT_* in code shared by both branches; r6's
-                                                              # generalization left them only in the re-entry branch, 2026-10-09 T001-d D4)
+  TASK_ID=$CREATE_ID
+  for s in $SLOTS; do EXPECT_OF[$s]=$(expect_of "$s"); done   # same as the re-entry branch: the new-launch branch must fill the per-slot expected cwds too
+                                                              # (r5 kept the three EXPECT_* in code shared by both branches; r6's generalization left them only in the re-entry branch, 2026-10-09 T001-d D4)
   echo "new: task directory initialized (path plan $PATH_PLAN; lock held, released once the ACK passes)"
 fi
+export TASK_ID                                          # the task identity number travels through the environment to the reuse check (needed to rebuild the expected ACK)
 # ══ First-run flow block (end) ══
 
-# Reuse check: exactly match N full agent names against the JSON; then check each slot's cwd == that slot's **expected cwd**
-# (under the git plan = that slot's worktree; the non-git fallback = the main tree) — expected values always come from the
-# manifest above
-# (not "require every slot's cwd to be equal" — same tab but having wandered into another directory still cannot be reused);
+# Reuse check: JSON-exact match of the N full agent names; then each slot's cwd is checked against that slot's **expected cwd** (under the frozen path plan)
+# (it is not "require every slot's cwd to be equal" — same tab but having wandered into another directory still cannot be reused);
 # both sides are compared after realpath normalization — a path with `..` and a canonical cwd that point at the same directory
 # must compare equal, or a normal re-entry would be misjudged;
-# a missing tab_id/workspace_id exits non-zero (fail-closed); "it printed a conclusion" is not a pass
-# Hookless slots ($HOOKLESS, each item <slot>=<cli>; profiles that declare they are not in the herdr registry, e.g. genox) are exempt from the
+# a missing tab_id/workspace_id exits non-zero (fail-closed); "it printed a conclusion" is not a pass;
+# a registered member's actual backend kind (when the output carries that field) must equal the frozen roster's CLI for that slot — same slot, swapped backend = identity mismatch;
+# hookless slots ($HOOKLESS, each item <slot>=<cli>; profiles that declare they are not in the herdr registry, e.g. genox) are exempt from the
 # agent-list existence check and are verified three ways instead:
-#   ① pane identity: the pane recorded in panes.txt is still present, label == <slot>-<tag>, same tab, cwd as expected;
-#   ② pane process alive: the foreground process is non-empty and its name == the CLI declared for that slot (absent = missing, refill that one slot);
-#   ③ on-disk ACK identity: bootstrap-ack.md is byte-equal to this run's ack-expected (an ACK from another task is not accepted — no cross-task reuse)
-# Expected paths are passed item by item as argv from a **referenced bash array** (a path with spaces is not split); the parser first
-# asserts "slot count == path count, non-empty, unique" and only then compares.
+#   ① pane identity: that slot's mapping in panes.txt is **unique** (missing field / duplicate line / duplicate pane all rc=3), looked up
+#      **by pane ID** (not by label) in pane list, checking label == <slot>-<tag>, same tab/workspace, and that pane's own cwd == expected;
+#   ② process evidence from the same cell: pane-info-<slot>.json's process_info.pane_id must == the pane ID from ① (evidence from a
+#      different pane may never be stitched in), the foreground process must be non-empty, its name == the CLI declared for that slot, and its cwd == expected (no process = missing, refill that one cell);
+#   ③ on-disk ACK identity: **rebuild** the N+2-line expectation from the **already uniquely parsed task identity** (TASK_ID) + tag + the current N full member names,
+#      then compare bootstrap-ack.md against it in full (an empty expectation / wrong tag / wrong bootstrap-id / wrong member order are all rejected; not an existence grep);
+# Order: first check the identity of **every member on stage**, and any inconsistency takes precedence as rc=3; only then compute the missing set, and rc=2 reports only the missing slots.
+# The missing list lands in $TD/missing-slots.txt (one space-separated line) for the "refill only" launch branch to read; the expected paths travel item by
+# item as argv from a **referenced bash array** (a path with spaces is not split); the parser first asserts "slot count == path count, non-empty, unique" and only then compares.
 herdr agent list > "$TD/agent-list.json"
 herdr pane list  > "$TD/pane-list.json"
 for _hs in $HOOKLESS; do
   s=${_hs%%=*}                                          # each $HOOKLESS item is <slot>=<cli>: take the slot name to look up panes.txt and to name the pane-info file
-  p=$( [ -s "$TD/panes.txt" ] && awk -v s="$s" '$1 == s {print $2}' "$TD/panes.txt" )
+  p=""
+  if [ -s "$TD/panes.txt" ]; then
+    # that slot's mapping in panes.txt must be exactly one line with both fields non-empty: a missing field or a duplicate mapping fails closed (never pick one line and hope)
+    p=$(awk -v s="$s" '$1 == s {n++; id=$2} END {if (n != 1) exit 1; print id}' "$TD/panes.txt") \
+      || { echo "the pane mapping for slot $s in panes.txt is missing or duplicated (<slot> <pane_id> must be exactly one line): fail-closed, manual confirmation"; exit 3; }
+  fi
   [ -n "$p" ] || continue                               # no pane record → let the parser report it as a missing member (a fresh launch has no panes yet)
   herdr pane process-info --pane "$p" > "$TD/pane-info-$s.json" \
     || { echo "cannot get pane process-info for hookless slot $s: fail-closed, manual confirmation"; exit 3; }
@@ -407,64 +511,140 @@ python3 -c '
 import json,os,sys
 tag=sys.argv[1]; slots=sys.argv[2].split(); hookless=sys.argv[3].split()
 td=sys.argv[4]; paths=sys.argv[5:]
+taskid=os.environ.get("TASK_ID",""); rnorm=os.environ.get("ROSTER_NORM","")
+def bad(msg):
+    print(msg); sys.exit(3)
 if not slots or len(set(slots))!=len(slots) or len(paths)!=len(slots) or any(not p for p in paths):
-    print("复用检查入参不完整:槽位 %d 个、路径 %d 个(fail-closed,不复用)"%(len(slots),len(paths))); sys.exit(3)
+    bad("复用检查入参不完整:槽位 %d 个、路径 %d 个(fail-closed,不复用)"%(len(slots),len(paths)))
+if not taskid or not rnorm:
+    bad("复用检查缺任务身份/规范 roster(TASK_ID/ROSTER_NORM 环境变量):fail-closed,不复用")
+cli={}
+for part in rnorm.split("+"):
+    seg=part.replace("=",":",1).split(":")
+    if len(seg)<2 or not seg[0] or not seg[1]: bad("规范 roster 解析不过: "+part)
+    cli[seg[0]]=seg[1]
+if set(cli)!=set(slots): bad("规范 roster 的槽位集合与本次槽位表不符:fail-closed")
 hook=dict(h.split("=",1) for h in hookless)
-agents=json.load(open(os.path.join(td,"agent-list.json")))["result"]["agents"]
-panes=json.load(open(os.path.join(td,"pane-list.json")))["result"]["panes"]
 expect={s:p for s,p in zip(slots,paths)}
 def norm(p):
     return os.path.realpath(p) if p else p
-def bad(msg):
-    print(msg); sys.exit(3)
-def pinfo(s):
-    f=os.path.join(td,"pane-info-"+s+".json")
-    if not os.path.exists(f): return {}
-    return json.load(open(f)).get("result",{}).get("process_info",{})
-got={a.get("name"):a for a in agents}
-missing=[s for s in slots if s not in hook and (s+"-"+tag) not in got]
+def load(name):
+    f=os.path.join(td,name)
+    if not os.path.exists(f): return None
+    try:
+        return json.load(open(f,encoding="utf-8"))
+    except Exception as e:
+        bad(name+" 读不出或不是合法 JSON: "+str(e)+":fail-closed,不复用")
+def panes_txt():                                        # unique parse of panes.txt: a missing field / duplicate slot / duplicate pane is rc=3
+    f=os.path.join(td,"panes.txt")
+    if not os.path.exists(f): return {},False           # no panes.txt yet = a brand-new task, not an inconsistency
+    m={}; ids={}
+    for i,l in enumerate(open(f,encoding="utf-8"),1):
+        l=l.rstrip("\n")
+        if not l: bad("panes.txt 第 %d 行是空行:fail-closed"%i)
+        parts=l.split()
+        if len(parts)!=2: bad("panes.txt 第 %d 行不是 <slot> <pane_id> 两段: %r,fail-closed"%(i,l))
+        s,p=parts
+        if s in m: bad("panes.txt 里槽位 %s 有多条 pane 映射:fail-closed"%s)
+        if p in ids: bad("panes.txt 里 pane %s 被多个槽位引用:fail-closed"%p)
+        m[s]=p; ids[p]=s
+    return m,True
+al=load("agent-list.json"); pl=load("pane-list.json")
+if al is None or pl is None: bad("agent-list.json / pane-list.json 缺一个:fail-closed,不复用")
+agents=al.get("result",{}).get("agents"); panes=pl.get("result",{}).get("panes")
+if not isinstance(agents,list) or not isinstance(panes,list): bad("agent list / pane list 结构不是列表:fail-closed")
+got={}
+for a in agents:
+    n=a.get("name")
+    if n in got: bad("agent list 里重名 %r:fail-closed"%n)
+    got[n]=a
+pane_by_id={}
+for p in panes:
+    pid=p.get("pane_id")
+    if not pid: bad("pane list 有条目缺 pane_id:fail-closed")
+    if pid in pane_by_id: bad("pane list 里 pane_id %s 重复:fail-closed"%pid)
+    pane_by_id[pid]=p
+ptxt, ptxt_ok = panes_txt()
+tabs=set(); missing=[]; why={}; hook_live=False
+for s in slots:                                         # order: every member on stage first, the missing set after (E2-4)
+    if s in hook:
+        pid=ptxt.get(s)
+        if pid is None:
+            if ptxt_ok: bad("panes.txt 在、却没有槽位 %s 的 pane 映射:不一致,fail-closed"%s)
+            missing.append(s); why[s]="还没有 pane 记录(fresh)"; continue
+        pane=pane_by_id.get(pid)
+        if pane is None: bad("无钩子槽位 %s 的 pane %s 不在 pane list 里:fail-closed"%(s,pid))
+        if pane.get("label")!=s+"-"+tag:
+            bad("pane %s 的 label=%r ≠ %s:证据不是同一格,fail-closed"%(pid,pane.get("label"),s+"-"+tag))
+        if not pane.get("tab_id") or not pane.get("workspace_id"): bad("pane %s 缺 tab_id/workspace_id:fail-closed"%pid)
+        if norm(pane.get("cwd"))!=norm(expect[s]):
+            bad("pane %s 的 cwd=%s ≠ 预期 %s(realpath 规范化后仍不同):fail-closed"%(pid,pane.get("cwd"),expect[s]))
+        info=load("pane-info-"+s+".json")
+        if info is None: bad("无钩子槽位 %s 缺 pane-info-%s.json(进程证据):fail-closed"%(s,s))
+        pi=info.get("result",{}).get("process_info")
+        if not isinstance(pi,dict): bad("pane-info-%s.json 里没有 process_info:fail-closed"%s)
+        if pi.get("pane_id")!=pid:
+            bad("槽位 %s 的进程证据来自 pane %s、panes.txt 记的是 %s:不许拼接不同 pane 的证据,fail-closed"%(s,pi.get("pane_id"),pid))
+        procs=pi.get("foreground_processes") or []
+        if not procs:
+            missing.append(s); why[s]="pane 内无前台进程(在原 pane 上重起)"; continue
+        p0=procs[0]; pname=p0.get("name") or ((p0.get("argv") or [""])[0])
+        if pname!=hook[s]: bad("槽位 %s pane 前台进程=%s ≠ 该槽位 CLI=%s:fail-closed,人工确认"%(s,pname,hook[s]))
+        if norm(p0.get("cwd"))!=norm(expect[s]):
+            bad("槽位 %s pane 进程 cwd=%s ≠ 预期 %s(realpath 规范化后仍不同):fail-closed"%(s,p0.get("cwd"),expect[s]))
+        tabs.add(pane.get("tab_id")); hook_live=True
+    else:
+        w=s+"-"+tag; a=got.get(w)
+        if a is None:
+            missing.append(s); why[s]="agent list 里没有"; continue
+        if not a.get("tab_id") or not a.get("workspace_id"): bad(w+" 缺 tab_id/workspace_id,fail-closed:不复用")
+        if norm(a.get("cwd"))!=norm(expect[s]): bad(w+" cwd="+str(a.get("cwd"))+" ≠ 预期 "+str(expect[s])+"(realpath 规范化后仍不同):不复用")
+        k=a.get("kind")
+        if k is not None and k!=cli[s]:
+            bad(w+" 实际后端 kind="+str(k)+" ≠ 冻结 roster 的 CLI="+cli[s]+":身份不符,fail-closed")
+        tabs.add(a.get("tab_id"))
+if len(tabs)>1: bad("成员不在同一 tab: "+", ".join(sorted(str(t) for t in tabs)))
+if hook_live:                                           # a hookless instance is on stage: the on-disk ACK must equal the **rebuilt** expectation
+    want="bootstrap-id: "+taskid+"\ntag: "+tag+"\n"+"".join(s+"-"+tag+"\n" for s in slots)
+    n_exp=len(slots)+2
+    ef=os.path.join(td,"ack-expected")
+    if os.path.exists(ef) and open(ef,encoding="utf-8").read()!=want:
+        bad("落盘 ack-expected 与按任务身份重建的期望不同:身份没显式更新或被改过,fail-closed")
+    af=os.path.join(td,"bootstrap-ack.md")
+    ack=open(af,encoding="utf-8").read() if os.path.exists(af) else ""
+    if ack!=want:
+        bad("无钩子槽位复用的落盘 ACK 身份不成立:与按任务身份重建的 %d 行期望不全等(空/错 tag/错 bootstrap-id/错成员序都算):fail-closed,人工确认"%n_exp)
+open(os.path.join(td,"missing-slots.txt"),"w",encoding="utf-8").write(" ".join(missing)+"\n")
 if missing:
-    print("缺: "+", ".join(s+"-"+tag for s in missing)); sys.exit(2)
-by_label={p.get("label"):p for p in panes}
-tabs=set()
-for s in slots:
-    if s in hook: continue
-    w=s+"-"+tag; a=got[w]
-    if not a.get("tab_id") or not a.get("workspace_id"):
-        bad(w+" 缺 tab_id/workspace_id,fail-closed:不复用")
-    if norm(a.get("cwd"))!=norm(expect[s]):
-        bad(w+" cwd="+str(a.get("cwd"))+" ≠ 预期 worktree="+str(expect[s])+"(realpath 规范化后仍不同):不复用")
-    tabs.add(a.get("tab_id"))
-for s in sorted(hook):
-    w=s+"-"+tag; pane=by_label.get(w)
-    if pane is None:
-        print("缺: "+w+"(无钩子槽位:panes.txt 记的 pane 不在 list 里,按只补缺在该 pane 重起)"); sys.exit(2)
-    procs=pinfo(s).get("foreground_processes") or []
-    if not procs:
-        print("缺: "+w+"(无钩子槽位:pane 内无前台进程,按只补缺在该 pane 重起)"); sys.exit(2)
-    p0=procs[0]; pname=p0.get("name") or ((p0.get("argv") or [""])[0])
-    if pname!=hook[s]:
-        bad(w+" pane 前台进程="+str(pname)+" ≠ 该槽位 CLI="+hook[s]+":fail-closed,人工确认")
-    if norm(p0.get("cwd"))!=norm(expect[s]):
-        bad(w+" pane 进程 cwd="+str(p0.get("cwd"))+" ≠ 预期 worktree="+str(expect[s])+"(realpath 规范化后仍不同):不复用")
-    if not pane.get("tab_id") or not pane.get("workspace_id"):
-        bad(w+" pane 缺 tab_id/workspace_id,fail-closed:不复用")
-    tabs.add(pane.get("tab_id"))
-if len(tabs)!=1:
-    bad("成员不在同一 tab: "+", ".join(sorted(str(t) for t in tabs)))
-if hook:
-    ack=os.path.join(td,"bootstrap-ack.md"); want=os.path.join(td,"ack-expected")
-    ok=os.path.exists(ack) and os.path.exists(want) and open(ack,"rb").read()==open(want,"rb").read()
-    if not ok:
-        bad("无钩子槽位复用的落盘 ACK 身份不成立(bootstrap-ack.md 与本次 ack-expected 不全等):fail-closed,人工确认")
-print("%d 名成员齐全:同 tab,各自 cwd 与预期 worktree 一致(realpath 规范化后);无钩子槽位 pane 进程存活且落盘 ACK 身份已核"%len(slots))' \
+    print("缺: "+", ".join(s+"-"+tag+"("+why[s]+")" for s in missing)+":只补缺,只对这几格动手,已在场成员一个都不重启")
+    print("missing-slots: "+" ".join(missing)); sys.exit(2)
+print("%d 名成员齐全:同 tab,各自 cwd 与预期一致(realpath 规范化后);已注册成员后端与冻结 roster 一致;无钩子槽位 pane 身份链(panes.txt→pane list→同一 pane 的进程证据)已核,落盘 ACK 与重建期望全文全等"%len(slots))' \
   "$TAG" "$SLOTS" "$HOOKLESS" "$TD" "${EXPECT_ARGS[@]}"
-# Exit codes: 0 = reusable; 2 = members missing (create only those; a hookless slot counts as missing when no process runs in its pane);
-# 3 = topology/directory mismatch, missing fields, or a hookless slot's on-disk ACK identity failing (fail-closed, do not reuse
-# automatically, rebuild after manual confirmation)
-# Expected cwds always come from the manifest: on a new launch they are written per the path plan fixed in the "first-run flow
-# block" (git → the main tree + N−1 sibling worktrees; non-git → all N cwds record the main tree, allowed only in attended
-# mode), and on re-entry they are read back through the unique parse — here the N expected paths are passed to the reuse check
+# The reuse-check verdict → what this launch does: 0 = everything reusable (start nothing); 2 = refill only (iterate only $MISSING_SLOTS);
+# anything else (3 = topology/directory/identity mismatch) = fail-closed, stop here for manual confirmation. Read the list back and check it once more
+# (empty / an unknown slot / a duplicate all fail closed)
+_reuse_rc=$?
+REUSE=""
+MISSING_SLOTS=""
+case "$_reuse_rc" in
+  0) REUSE=ok ;;
+  2) REUSE=refill
+     MISSING_SLOTS=$(cat "$TD/missing-slots.txt" 2>/dev/null) \
+       || { echo "cannot read the missing-slot list $TD/missing-slots.txt: fail-closed, manual confirmation"; exit 3; }
+     [ -n "$MISSING_SLOTS" ] || { echo "the missing-slot list is empty while the exit code is 2: self-contradictory, fail-closed"; exit 3; }
+     for s in $MISSING_SLOTS; do
+       case " $SLOTS " in *" $s "*) ;; *) echo "the missing-slot list contains $s, which is not in this round's slot table: fail-closed"; exit 3 ;; esac
+     done
+     [ "$(printf '%s\n' $MISSING_SLOTS | sort | uniq -d | wc -l)" = 0 ] \
+       || { echo "the missing-slot list contains duplicates: fail-closed"; exit 3; }
+     ;;
+  *) echo "reuse check returned ${_reuse_rc} (identity/topology/directory mismatch): fail-closed, confirm by hand before launching"; exit 3 ;;
+esac
+export REUSE MISSING_SLOTS
+# Exit codes: 0 = reusable (REUSE=ok); 2 = members missing (REUSE=refill, only the slots in $MISSING_SLOTS; a hookless slot counts as missing when no process runs in its pane);
+# 3 = topology/directory mismatch, missing field, pane-evidence stitching, or a hookless slot's ACK identity failing (fail-closed, do not reuse automatically, rebuild after manual confirmation)
+# Expected cwds always come from the manifest: on a new launch they are written per the path plan fixed in the "first-run flow block" (git → the main tree + N−1 sibling worktrees;
+# non-git → all N cwds record the main tree, allowed only in attended mode), and on re-entry they are read back through the unique parse — here the N expected paths are passed to the reuse check
 ```
 
 ### Mode selection (after detection, before launch — mandatory)
@@ -494,83 +674,139 @@ The failure branch is not "launch with the permissive flags anyway and note it o
 Create a separate tab and launch N **brand-new clean** agents per the layout rules (do not resume from old sessions). **First create each slot's worktree in the main tree, then create panes and start agents with the corresponding cwd** (a worktree isolates only working files and the index, not git metadata, and is not a security boundary — see "Known limitations"; when the project directory is **not a git repo**, everything falls back to launching in the main tree with the same cwd, the isolation guarantee drops, **and unattended mode automatically falls back to attended mode** — see gate 3 of the "Unattended mode" enabling gates, and note it on the board):
 
 ```bash
-# 0) One worktree per non-orch slot (skip if it already exists); branch names carry the tag and the slot name, so they never overlap.
-#    Execute only per the path plan fixed in the "first-run flow block": the non-git fallback (main-only) is skipped, and all N cwds use the main tree
-if [ "$PATH_PLAN" = worktree ]; then
+# 0) one worktree per non-orch slot (skipped if it already exists); the branch name carries both the tag and the slot name, so they never overlap.
+#    Execute only the path plan fixed in the "first-run flow block": skip under the non-git fallback (main-only), where all N cwds are the main tree; on re-entry create none at all
+if [ "$CLASSIFY" = new ] && [ "$PATH_PLAN" = worktree ]; then
   for s in $SLOTS; do
     [ "$s" = orch ] && continue
     git worktree add "$PWD/../wt-$TAG-$s" -b "trio-$TAG-$s"
   done
 fi
 
-# 1) New tab: the orch slot stays in the main tree; root pane P0 parsed from the returned JSON
-P0=$(herdr tab create --workspace "$HERDR_WORKSPACE_ID" --cwd "${EXPECT_OF[orch]}" --label <task name> --no-focus \
-     | python3 -c 'import json,sys;print(json.load(sys.stdin)["result"]["root_pane"]["pane_id"])')
-# 2) Split-pane loop (P0 = the orch position): non-orch members in declaration order M1…M(N−1);
-#    M1: P0 --direction right → P1; Mk (k≥2): P(k−1) --direction down → Pk.
-#    At N=3 this matches the existing layout pane by pane; at N>3 the right column keeps extending downwards.
-#    Parse pane_id from the returned JSON at every split, never copy it by hand; also write $TD/panes.txt (`<slot> <pane_id>` one per line).
-#    slot → pane is kept in the **associative array** PANE_OF (no more building variable names out of slot names): the start loop and
-#    the rename loop both read it, and each slot asserts non-empty — a name mix-up like storing into PANE_OF_ORCH and reading PANE_ORCH
-#    would blank the pane, so it must stop on the spot.
-declare -A PANE_OF
-PANE_OF[orch]=$P0
-: > "$TD/panes.txt"; echo "orch $P0" >> "$TD/panes.txt"
-prev=$P0; first=1
-for s in $SLOTS; do
-  [ "$s" = orch ] && continue
-  if [ "$first" = 1 ]; then dir=right; first=0; else dir=down; fi
-  p=$(herdr pane split "$prev" --direction "$dir" --cwd "$(expect_of "$s")" --no-focus \
-      | python3 -c 'import json,sys;print(json.load(sys.stdin)["result"]["pane"]["pane_id"])')
-  [ -n "$p" ] || { echo "the pane_id parsed for slot $s is empty: stop for manual confirmation"; exit 1; }
-  PANE_OF[$s]=$p
-  echo "$s $p" >> "$TD/panes.txt"
-  prev=$p
-done
+declare -A PANE_OF                                       # slot → pane: both the start loop and the rename loop read it here, and each slot is asserted non-empty
+START_SLOTS=""                                           # slots to start this round: a new launch = all of them; a re-entry refill = only the missing ones
 
-# 3) Agent-start loop: look the slot up in "Backend profiles" and take parameters from the arrays chosen in "Mode selection";
-#    hard-coding bypass/auto is a process violation.
-#    The branch is on that slot's **cli** (not on the slot name): `herdr agent start` needs --kind (kimi/codex/claude etc.);
-#    a member whose profile declares "no hook" (genox) does not enter the registry and is started directly in its pane instead
-#    (`pane run genox`; with the installed 3.0.1 use `genox chat` for now — see the genox entry under "Backend profiles") — never fake a kind to register it, and never call it
-#    "missing" just because it is absent from agent list.
-for s in $SLOTS; do
+if [ "$CLASSIFY" = new ]; then
+  START_SLOTS=$SLOTS                                     # new launch: every slot must be started
+  # 1) New tab: the orch slot stays in the main tree; the root pane P0 is parsed from the returned JSON
+  P0=$(herdr tab create --workspace "$HERDR_WORKSPACE_ID" --cwd "${EXPECT_OF[orch]}" --label <task name> --no-focus \
+       | python3 -c 'import json,sys;print(json.load(sys.stdin)["result"]["root_pane"]["pane_id"])')
+  # 2) The pane-splitting loop (P0 = the orch position): non-orch members in declaration order M1…M(N−1);
+  #    M1: P0 --direction right → P1; Mk (k≥2): P(k−1) --direction down → Pk.
+  #    At N=3 this matches the current layout pane by pane; at N>3 the right column keeps extending downwards.
+  #    Parse each pane_id from the returned JSON right after splitting — never copy it by hand; and write $TD/panes.txt (one `<slot> <pane_id>` per line).
+  #    slot → pane is held in an **associative array** PANE_OF (no more assembling variable names from slot names): the start loop and the
+  #    rename loop both read it, and each slot is asserted non-empty — writing PANE_OF_ORCH but reading PANE_ORCH blanks the pane, so stop right there.
+  PANE_OF[orch]=$P0
+  : > "$TD/panes.txt"; echo "orch $P0" >> "$TD/panes.txt"
+  prev=$P0; first=1
+  for s in $SLOTS; do
+    [ "$s" = orch ] && continue
+    if [ "$first" = 1 ]; then dir=right; first=0; else dir=down; fi
+    p=$(herdr pane split "$prev" --direction "$dir" --cwd "$(expect_of "$s")" --no-focus \
+        | python3 -c 'import json,sys;print(json.load(sys.stdin)["result"]["pane"]["pane_id"])')
+    [ -n "$p" ] || { echo "pane_id for slot $s parsed empty: stop for manual confirmation"; exit 1; }
+    PANE_OF[$s]=$p
+    echo "$s $p" >> "$TD/panes.txt"
+    prev=$p
+  done
+elif [ "${REUSE:-}" = refill ]; then
+  # Re-entry refill: iterate **only** $MISSING_SLOTS; members already on stage are not touched at all (no agent start / pane run resent, no new pane/tab);
+  # the pane is always the original one recorded in panes.txt at the first launch — a re-entry never splits a new pane (geometry is not protocol identity; the identity anchor is manifest/panes.txt)
+  START_SLOTS=$MISSING_SLOTS
+  for s in $START_SLOTS; do
+    p=$(awk -v s="$s" '$1 == s {n++; id=$2} END {if (n != 1) exit 1; print id}' "$TD/panes.txt") \
+      || { echo "the pane mapping for slot $s in panes.txt is missing or duplicated: fail-closed, manual confirmation"; exit 3; }
+    [ -n "$p" ] || { echo "slot $s has no pane ID in panes.txt: fail-closed, manual confirmation"; exit 3; }
+    PANE_OF[$s]=$p
+  done
+elif [ "${REUSE:-}" = ok ]; then
+  :                                                      # everything reusable: start nothing and leave the panes alone
+else
+  echo "no usable reuse-check verdict (REUSE=${REUSE:-unset}, classification ${CLASSIFY}): never launch blindly, stop for manual confirmation"; exit 3
+fi
+
+# 3) Start loop: look up the "backend profile" per slot; the permission flags come from the "mode selection" arrays, while the
+#    **model/effort are composed per slot** from the canonical roster;
+#    hard-coding bypass/auto is a protocol violation, and so is hard-coding the model in a shared array (two slots on the same CLI would overwrite each other).
+#    Branch on that slot's **cli** (not on the slot name): herdr agent start needs --kind (kimi/codex/claude etc.);
+#    a member whose profile declares "no hook" (genox) never enters the registry and is started straight in its pane (`pane run genox`; the version
+#    installed today, 3.0.1, reports `Missing command` for bare `genox` (measured, exit code 2), so `genox chat` is used for now; once the upstream PR
+#    merges, the bare command is equivalent to it — that equivalence is **[not tested]**; see the genox entry under "Backend profiles"),
+#    fake no kind registration, and never call it "missing" just because it is absent from agent list.
+SLOT_ARGS=()                                            # composed output: cleared before every call
+slot_argv_of() {                                        # $1 = slot: composed only from that slot's canonical roster declaration (gate ⑧ already blocks "declared but no flag" input)
+  SLOT_ARGS=()
+  case "${CLI_OF[$1]}" in
+    kimi)   if [ -n "${MODEL_OF[$1]}" ]; then SLOT_ARGS+=(-m "${MODEL_OF[$1]}"); fi ;;
+    codex)  if [ -n "${MODEL_OF[$1]}" ]; then SLOT_ARGS+=(-m "${MODEL_OF[$1]}"); fi
+            if [ -n "${EFFORT_OF[$1]}" ]; then SLOT_ARGS+=(-c "model_reasoning_effort=${EFFORT_OF[$1]}"); fi ;;
+    claude) if [ -n "${MODEL_OF[$1]}" ]; then SLOT_ARGS+=(--model "${MODEL_OF[$1]}"); fi
+            if [ -n "${EFFORT_OF[$1]}" ]; then SLOT_ARGS+=(--effort "${EFFORT_OF[$1]}"); fi ;;
+    *)      if [ -n "${MODEL_OF[$1]}${EFFORT_OF[$1]}" ]; then
+              echo "CLI ${CLI_OF[$1]} of slot $1 has no registered model/effort composition rule: never drop it silently, stop and add the rule per the 'backend profile'"
+              return 1
+            fi ;;
+  esac
+  return 0
+}
+for s in $START_SLOTS; do
   pane=${PANE_OF[$s]}
-  [ -n "$pane" ] || { echo "slot $s has no pane (the split-pane loop never assigned it): stop for manual confirmation"; exit 1; }
+  [ -n "$pane" ] || { echo "slot $s has no pane (the split loop never assigned it): stop for manual confirmation"; exit 1; }
+  slot_argv_of "$s" || exit 1
   case "${CLI_OF[$s]}" in
-    genox)  herdr pane run "$pane" "genox chat" ;;                    # no hook: the only usable set = attended; parameters in "Backend profiles"
-    kimi)   herdr agent start "$s-$TAG" --kind kimi   --pane "$pane" -- "${KIMI_ARGS[@]}" ;;
-    codex)  herdr agent start "$s-$TAG" --kind codex  --pane "$pane" -- "${CODEX_ARGS[@]}" ;;
-    claude) herdr agent start "$s-$TAG" --kind claude --pane "$pane" -- "${CLAUDE_ARGS[@]}" ;;
-    *)      echo "the CLI ${CLI_OF[$s]} of slot $s has no parameter set registered in this loop: measure it against that CLI's --help, add a case (do not reuse the values above), then launch"; exit 1 ;;
+    genox)  herdr pane run "$pane" "genox chat" ;;                    # hookless: the only usable mode = a human present; flags in "Backend profiles"
+    kimi)   herdr agent start "$s-$TAG" --kind kimi   --pane "$pane" -- "${KIMI_ARGS[@]}"   "${SLOT_ARGS[@]}" ;;
+    codex)  herdr agent start "$s-$TAG" --kind codex  --pane "$pane" -- "${CODEX_ARGS[@]}"  "${SLOT_ARGS[@]}" ;;
+    claude) herdr agent start "$s-$TAG" --kind claude --pane "$pane" -- "${CLAUDE_ARGS[@]}" "${SLOT_ARGS[@]}" ;;
+    *)      echo "CLI ${CLI_OF[$s]} of slot $s has no registered flag set in this loop: measure it against the 'backend profile' and add a case (do not reuse the values above), then launch"; exit 1 ;;
   esac
 done
-# With the default roster this expands to exactly:
-#   herdr agent start "orch-$TAG" --kind kimi  --pane "${PANE_OF[orch]}" --
-#   herdr agent start "rev-$TAG"  --kind codex --pane "${PANE_OF[rev]}"  -- -m gpt-6.1-sol -c model_reasoning_effort=high
+# With the default roster expanded, this is equivalent to (the permission arrays carry permission flags only; model/effort come from each slot's roster declaration):
+#   herdr agent start "orch-$TAG" --kind kimi  --pane "${PANE_OF[orch]}" -- "${KIMI_ARGS[@]}"
+#   herdr agent start "rev-$TAG"  --kind codex --pane "${PANE_OF[rev]}"  -- "${CODEX_ARGS[@]}"  -m gpt-6.1-sol -c model_reasoning_effort=high
 #   herdr agent start "exec-$TAG" --kind claude --pane "${PANE_OF[exec]}" -- "${CLAUDE_ARGS[@]}"
-# Array elements become separate argv items one by one; a path containing spaces is not split and an empty array produces no
-# argument. Do not fall back to string concatenation (see the measurement in "Mode selection")
-# The model slug and the reasoning level must be passed separately: the slug carries no level, and the level uses its own config
-# key; `--settings` builds its path from the skill-directory variable instead of a hard-coded username
+# Each array element becomes its own argv: a path with spaces is not split, and an empty array contributes no argument; never fall back to string concatenation (see the measurements under "Mode selection")
+# The model slug and the effort level must be passed separately: the slug carries no level, the level uses its own config key; `--settings` composes the path from the skill-directory variable, never a hard-coded username
 
-# 4) Rename all N panes (mandatory; skipping it leaves the agent name and the display label inconsistent); the pane label and the agent name are two objects
-for s in $SLOTS; do
+# 4) Rename the panes started this round (new launch = all; re-entry refill = only the missing ones); the pane label and the agent name are two different objects
+for s in $START_SLOTS; do
   pane=${PANE_OF[$s]}
-  [ -n "$pane" ] || { echo "slot $s has no pane (the split-pane loop never assigned it): stop for manual confirmation"; exit 1; }
+  [ -n "$pane" ] || { echo "slot $s has no pane (the split loop never assigned it): stop for manual confirmation"; exit 1; }
   herdr pane rename "$pane" "$s-$TAG"
 done
 
-# 5) Bootstrap: the task directory/manifest/lock were already handled in the "detection" step → create the taskboard skeleton
-#    (only if missing; never overwrite on re-entry) → take this launch's bootstrap ID → wait for the ACK to be byte-identical to
-#    the expectation (cmp) — that is what "the launch is complete" means
-TD="/tmp/$TAG"                             # the same task directory as in the "first-run flow block"; re-set here so this block can be lifted out for self-testing
+# 5) bootstrap: the task directory/manifest/lock were settled in the "detection" step → create the taskboard skeleton (only if missing; a re-entry never overwrites) →
+#    fix the **task ID** (bootstrap-id) → wait until the ACK is byte-equal to the expectation (cmp) — that, and only that, is the "launch complete" criterion
+TD="/tmp/$TAG"                             # the same task directory as the "first-run flow block"; reset here so this block can be lifted out and tested on its own
 mkdir -p "$TD"                             # idempotent
-SKILL_ABS=<the skill's absolute path, known to the sender>   # e.g. /home/<user>/.kimi-code/skills/trio-orchestrate; always write absolute paths in the package, never assume the other side expands ${KIMI_SKILL_DIR}
-# ══ bootstrap ACK closed-loop block (begin): lift this whole block out, set TD/TAG/SKILL_ABS/SLOTS, and it runs standalone (a stub may stand in on the other side) ══
-# Seconds + a random tail only lowers the chance of a collision; it does not promise concurrent uniqueness. Concurrency
-# exclusivity is carried by launch.lock — one TAG allows only one launch flow at a time.
-BOOT_ID=$(date +%s)-$RANDOM                # this launch's batch id: it is how a stale ACK or a failed leftover is told apart
+SKILL_ABS=<absolute path of the skill, known to the sender>   # e.g. /home/<user>/.kimi-code/skills/trio-orchestrate; always an absolute path inside the package, never assume the peer expands ${KIMI_SKILL_DIR}
+# ══ bootstrap ACK closure block (begin): lift this whole block out, set TD/TAG/SKILL_ABS/SLOTS, and it runs standalone (the peer's herdr can be stubbed) ══
+CLASSIFY=${CLASSIFY:-new}                  # default for lifting this block out on its own: go as a "new launch" (never touches the manifest)
+START_SLOTS=${START_SLOTS:-$SLOTS}         # same: default to every slot
+# The task identity number has exactly **one** source, and three places must agree with it: the manifest's bootstrap-id line, the ACK expectation, and the sample handed to the peer.
+#   new launch: the identity number = the CREATE_ID minted by the first-run flow block (already in the manifest); this block only reads it;
+#   re-entry that really did start agents (refill/regroup): **explicitly mint a new identity number** — first rewrite the manifest's bootstrap-id line atomically, then rebuild the ACK expectation from it.
+#     Never carry the old number over implicitly: the old ACK is exactly what the old number certifies, so keeping it means "two generations of members share one receipt", and a broken identity chain stays invisible.
+#   re-entry that started nothing (REUSE=ok): keep the identity number from the manifest and do not resend bootstrap (everyone is on stage, the old ACK still holds).
+if [ -n "$START_SLOTS" ] && [ "$CLASSIFY" = reentry ]; then
+  TASK_ID=$(date +%s)-$RANDOM
+  python3 - "$TD/manifest.txt" "$TASK_ID" <<'PY' || { echo "regrouping could not mint a new task identity number (manifest unwritable): fail-closed, manual confirmation"; exit 1; }
+import os, sys
+path, tid = sys.argv[1], sys.argv[2]
+with open(path, encoding="utf-8") as f:
+    lines = f.read().splitlines()
+hit = [i for i, x in enumerate(lines) if x.startswith("bootstrap-id: ")]
+if len(hit) != 1:
+    sys.exit("manifest 的 bootstrap-id 行不是恰好一条:fail-closed,人工确认")
+lines[hit[0]] = "bootstrap-id: " + tid
+tmp = path + ".tmp"
+with open(tmp, "w", encoding="utf-8") as f:
+    f.write("\n".join(lines) + "\n")
+os.replace(tmp, path)                      # rewritten in the same directory: either the whole old text or the whole new text, never a half-written file
+PY
+fi
+[ -n "${TASK_ID:-}" ] || { echo "the task identity number is empty (neither a new launch nor a re-entry minted one): fail-closed, manual confirmation"; exit 1; }
 [ -f "$TD/taskboard.md" ] || cat > "$TD/taskboard.md" <<'EOF'
 # taskboard
 
@@ -579,35 +815,37 @@ BOOT_ID=$(date +%s)-$RANDOM                # this launch's batch id: it is how a
 ## 待审
 ## 已验收(附证据路径)
 EOF
-# The line count varies with N: the ACK expectation = the bootstrap-id line + the tag line + N lines of <slot>-<tag> (fixed slot
-# order), with one trailing newline preserved
-NAMES=$(for s in $SLOTS; do echo "$s-$TAG"; done)      # N full names, fixed slot order
-rm -f "$TD/bootstrap-ack.md"               # clear the old ACK: only the receipt written by this run counts
-{
-  echo "bootstrap-id: $BOOT_ID"
-  echo "技能文件:$SKILL_ABS/SKILL.md(绝对路径;先激活技能并读这个文件,不要依赖占位符自动展开)"
-  echo "tag: $TAG"
-  echo "看板:$TD/taskboard.md(骨架已建好)"
-  echo "成员全名:$(echo $NAMES | tr ' ' '/')(编排 + 审阅 + 执行等;限 [机核] 的条目见看板规则)"
-  echo "指令:读技能与看板后,把 ACK 写到 $TD/bootstrap-ack.md。ACK 必须与下面 $((N + 2)) 行**逐字节一致**(照抄、一行一项、不加别的字符、行尾不留空格、末尾保留一个换行):"
-  echo "bootstrap-id: $BOOT_ID"
-  echo "tag: $TAG"
-  for n in $NAMES; do echo "$n"; done
-  echo "不要再执行拉起流程(不要建新 tab、不要起新代理)。"
-} > "$TD/bootstrap.md"
-# The full expected ACK text (byte-identical to the $((N + 2)) lines handed to the other side above), compared in full on acceptance:
-# an existence grep cannot stop "two contradictory values of the same field / duplicate lines / extra lines" (2026-10-09 verdict),
-# so the whole text must be compared
-{
-  echo "bootstrap-id: $BOOT_ID"
-  echo "tag: $TAG"
-  for n in $NAMES; do echo "$n"; done
-} > "$TD/ack-expected"
-herdr agent prompt "orch-$TAG" "读 $TD/bootstrap.md 并按其指令执行" --wait --timeout 120000
-ack="$TD/bootstrap-ack.md"
-cmp -s "$TD/ack-expected" "$ack" || { echo "ACK differs from the expectation in full text (contradictory/duplicate/extra/missing lines): launch is not complete"; exit 1; }
-rmdir "$TD/launch.lock"                    # ACK passed = launch complete, release the exclusive lock; if it failed midway, handle by hand before deleting the lock and re-entering
-# ══ bootstrap ACK closed-loop block (end) ══
+# The line count follows N: the expected ACK = the bootstrap-id line + the tag line + N lines <slot>-<tag> (fixed slot order), with one trailing newline kept
+NAMES=$(for s in $SLOTS; do echo "$s-$TAG"; done)      # the N full names, in fixed slot order
+if [ -n "$START_SLOTS" ]; then
+  rm -f "$TD/bootstrap-ack.md"             # drop the old ACK: only the receipt written this round counts (when the identity number changed, this also voids the old one)
+  {
+    echo "bootstrap-id: $TASK_ID"
+    echo "技能文件:$SKILL_ABS/SKILL.md(绝对路径;先激活技能并读这个文件,不要依赖占位符自动展开)"
+    echo "tag: $TAG"
+    echo "看板:$TD/taskboard.md(骨架已建好)"
+    echo "成员全名:$(echo $NAMES | tr ' ' '/')(编排 + 审阅 + 执行等;限 [机核] 的条目见看板规则)"
+    echo "指令:读技能与看板后,把 ACK 写到 $TD/bootstrap-ack.md。ACK 必须与下面 $((N + 2)) 行**逐字节一致**(照抄、一行一项、不加别的字符、行尾不留空格、末尾保留一个换行):"
+    echo "bootstrap-id: $TASK_ID"
+    echo "tag: $TAG"
+    for n in $NAMES; do echo "$n"; done
+    echo "不要再执行拉起流程(不要建新 tab、不要起新代理)。"
+  } > "$TD/bootstrap.md"
+  # The full expected ACK (byte-identical to the $((N + 2)) lines handed to the peer above); acceptance is a full-text comparison:
+  # an existence grep cannot stop "one field with two contradictory values / a duplicated line / an extra line" (2026-10-09 verdict), so the whole text is compared
+  {
+    echo "bootstrap-id: $TASK_ID"
+    echo "tag: $TAG"
+    for n in $NAMES; do echo "$n"; done
+  } > "$TD/ack-expected"
+  herdr agent prompt "orch-$TAG" "read $TD/bootstrap.md and follow its instructions" --wait --timeout 120000
+  ack="$TD/bootstrap-ack.md"
+  cmp -s "$TD/ack-expected" "$ack" || { echo "the ACK is not byte-equal to the expectation (contradictory/duplicated/extra/missing line): launch incomplete"; exit 1; }
+else
+  echo "everything reusable (no agent was started this round): bootstrap is not resent — the reuse check already verified the ACK in full under the same identity number"
+fi
+rmdir "$TD/launch.lock"                    # ACK passed = launch complete, release the exclusive lock; if it stopped midway, handle it by hand first, then delete the lock and re-enter
+# ══ bootstrap ACK closure block (end) ══
 ```
 
 The layout is always: the orch position on the left (main tree); non-orch members run down the right column in declaration order (N=3 means the reviewer top-right and the executor bottom-right, matching the existing layout pane by pane; right first, then down, independent of width). At N>5 the right column becomes hard to read, so splitting the task or adjusting panes by hand is advisable — **protocol identity anchors on the manifest, not on geometry**, and adjusting panes by hand does not affect the protocol.
