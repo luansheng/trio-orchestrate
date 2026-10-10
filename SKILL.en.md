@@ -1,478 +1,732 @@
 ---
 name: trio-orchestrate
-description: "One-command launch and orchestration of three collaborating agents: kimi (orchestrate + accept) / codex (review) / claude (execute). Use when the user wants to start a new multi-agent task, or says 'set up three-way collaboration / start work / launch review and execution / set up the taskboard'. Takes an argument: /skill:trio-orchestrate <task tag>; the argument is used directly as the task tag. Depends on herdr (terminal multiplexer) to create panes, start agents, relay messages and watch status. The user only needs to start kimi and load this skill; the remaining panes are created automatically."
+description: "One-command launch and orchestration of a parameterized team of agents (default three-role setup: kimi orchestrates + accepts / codex reviews / claude executes; the team is declared by a roster and may have 2~N members, with genox among the optional members). Use when the user wants to start a new multi-agent task or says 'set up three-way collaboration / let's start / launch review and execution / put up the taskboard'. Takes parameters: /skill:trio-orchestrate <task tag> <roster>; the first parameter is the task tag, the second is the team declaration. Depends on herdr (terminal multiplexer) to create panes, start agents, relay messages and watch status. The user only starts kimi and loads this skill; the remaining panes are built automatically."
 arguments:
   - tag
+  - roster
 ---
 
-# Three-agent collaboration: one-command launch + orchestration (kimi orchestrates · codex-review reviews · claude-exec executes)
+# Parameterized team orchestration: one-command launch + orchestration (default roster = kimi orchestrates · codex reviews · claude executes)
 
 > Author: sheng luan
-> Dependencies: kimi CLI + herdr; if codex/claude is missing, fall back to "substitute team assembly". How to share: copy the whole `trio-orchestrate/` directory (including `claude-exec-deny.json`) into the other party's `~/.kimi-code/skills/`.
-> This skill is both a **launch protocol** and a **runtime protocol**. After sharing it, if you worry that ordinary conversation might accidentally trigger tab creation / mode switching, you may optionally add `disableModelInvocation: true` to the frontmatter so it is invoked only by explicit command.
+> Protocol version: **2026-10-10-r6**
+> Depends on: kimi CLI + herdr; if another CLI declared in the roster is missing, go to "Team assembly and substitutes". How to share: copy the whole `trio-orchestrate/` directory (including `claude-exec-deny.json`) into the other person's `~/.kimi-code/skills/`.
+> This skill is both a **launch protocol** and a **running protocol**. After sharing it, if you worry that ordinary conversation might accidentally trigger tab creation or mode switching, add `disableModelInvocation: true` to the frontmatter as needed, so it can only be invoked by an explicit command.
 
-## Roles and fixed names (no longer varying per task)
+## Slots and roster declaration (roles are determined by the roster parameter)
 
-| Role | Fixed name (agent name + pane label) | Backend | Mode |
-|---|---|---|---|
-| Orchestrate + accept | `kimi-orch` | kimi | `--auto` |
-| Review | `codex-review` | codex, **model and reasoning effort set separately** (e.g. model slug `gpt-6.1-sol` + reasoning effort `high`; the exact model is whatever appears in each person's codex `/model` list) | `--approve-for-me` |
-| Execute (layer C) | `claude-exec` | claude (each person chooses the backend; record the CLI kind and provider/model on the taskboard) | `--dangerously-skip-permissions` + at startup `--settings` mounts the skill directory's `claude-exec-deny.json` permanent deny list (sudo / disk destruction / force-push / push to main / reading secrets; bound only to claude-exec, does not affect the user running claude separately; everything else is allowed). **This list is only a textual prefix soft defense line, not a security boundary — see "Known limitations" for the forms that bypass it** |
+### Slot vocabulary (closed, enumerable, checkable)
 
-> The "Mode" column above gives the values of the **unattended parameter set**; whether to use them is decided by the three-gate result of "**Mode selection**" in Step 0 — if any gate fails, switch to the **attended parameter set**; they are not defaults.
+| Slot | Capability set | Notes |
+|---|---|---|
+| `orch` | {orch} | Orchestration + acceptance, **exactly one per roster, hard constraint** |
+| `rev` | {rev} | Review |
+| `rev2` | {rev} | Second review line (extension) |
+| `revtest` | {rev, exec} | Review + test composite slot (extension) |
+| `exec` | {exec} | Execution (layer C) |
+| `exec2`…`exec9` | {exec} | Additional execution lines |
 
-**Naming rule (key to multiple tabs coexisting)**: the actual agent name = `<role>-<task tag>`, e.g. `codex-review-g07tune`. Reason: herdr's **agent names are a global registry, unique across tabs/workspaces** (a collision was measured to report `agent_name_taken`; a pane label is only a display label, not an identity); legal characters are only `[a-z0-9_-]`, ≤32. The three-piece set in one tab shares one tag; the pane label stays consistent with the agent name. **The reuse check must use JSON exact matching of the three full agent names**, not substring matching such as `grep -- "-<tag>"`: `herdr agent list` returns compact single-line JSON, and grep would treat `g070` as `g07` and count another task's whole line in (measured 2026-10-09). See "Step 0" for an example. Another tab's three-piece set does not count, and is never reused across tasks.
+**Rules**:
 
-## Step 0: Launch the panes (three brand-new panes, a separate tab)
+1. **Coverage constraint**: every roster must have orch ≥1, rev ≥1, exec ≥1; member count **N ≥ 2** (one person is not a team). A missing capability is a rejection, and **the error names which capability is missing**.
+2. **Exactly one orchestrator** (hard constraint). Every reason is a direct corollary of existing discipline, and relaxing any of them tears the protocol: the single-writer taskboard rule requires exactly one writer, so two orch = two writers; ownership of launch.lock, creation/unique-parsing of the manifest and the classification verdict each need one unique authority, and two orch members would produce two classification verdicts; mode selection is the three-gate verdict of a "unique decision-maker", so two orch members would produce two parameter-set verdicts; the layer-A verdict and dispatch right, and the ACK collection and acceptance right, all anchor on a single orchestrator. **There is no "multiple orchestrators exception"**: the existing exception "the current session acts as orchestrator" is only an exception about where the orch **instance comes from** (do not create a new tab), not an exception about the number of orch members, and r6 keeps that reading.
+3. **Composite slot revtest and the invalidity of self-review**: "review + test" may be carried by one member, but that member's **review of work it produced itself does not count** — for such tickets the review signature must come from a rev-capability member in a different slot, or be escalated to the orch for a final verdict (annotated "self-review invalid, orch final verdict"). The orch already holds final-verdict authority (orchestration + acceptance); this clause only spells out "self-review is invalid".
 
-> The code block below is a **conceptual flow**, not a script you can paste as a whole: execute it step by step and **check the return code of every step**; if any prerequisite fails, stop immediately (fail-fast). Always parse P0/P1/P2 from the JSON returned by the command, never copy them by hand; see the example below. Before first use, run it through manually once: each CLI's login, the repository trust confirmation, and the first-time confirmation of bypass mode must not be left to an unattended period. **All code blocks are written in Bash syntax** (parameter sets use arrays, `"${ARR[@]}"` turns each element into its own argv; Zsh does not split unquoted scalars and behaves differently, so do not copy this directly into Zsh).
+### The roster DSL
+
+Entry point: `/skill:trio-orchestrate <tag> <roster>`. The roster is a **single-string DSL**, with members joined by `+` (not spaces, avoiding any ambiguity in parameter tokenization), each member being:
+
+```
+<slot>=<cli>[:<model>[:<effort>[:<family>]]]
+```
+
+- `slot`: slot ID, taken from the closed vocabulary above;
+- `cli`: backend CLI name (kimi/codex/claude/copilot/opencode/genox…), i.e. the herdr `--kind` or the backend-profile name;
+- `model`: model slug, optional (may be omitted for kimi/claude to use the default);
+- `effort`: reasoning level (high/medium/low), optional; the existing convention of **passing it separately from model** is kept;
+- `family`: explicit model-family declaration, optional, **default = the `model` string itself** (used for the same-origin check below).
+
+**Default declaration**: an empty roster → the default three-member team
+
+```
+orch=kimi+rev=codex:gpt-6.1-sol:high+exec=claude
+```
+
+This is the capability-equivalent of the existing three-piece setup and **guarantees that old invocation styles behave unchanged**.
+
+**Complete examples**:
+
+2 members (the smallest team with orchestration + review/execution combined; suited to light tasks):
+```
+/skill:trio-orchestrate hotfix orch=kimi+revtest=codex:gpt-6.1-sol:high
+```
+Expanded: orch=kimi (main tree) | revtest=codex gpt-6.1-sol high (its own worktree; capabilities={rev,exec}, its own output cannot be self-reviewed, the final verdict goes to the orch)
+
+3 members (the roster spelling of the current default):
+```
+/skill:trio-orchestrate genox orch=kimi+rev=codex:gpt-6.1-sol:high+exec=claude
+```
+
+4 members (two execution lines):
+```
+/skill:trio-orchestrate bench4 orch=kimi+rev=codex:gpt-6.1-sol:high+exec=claude+exec2=genox
+```
+Expanded: orch=kimi | rev=codex gpt-6.1-sol high | exec=claude | exec2=genox (the genox slot's parameter set and limits are in "Backend profiles")
+
+### The pairwise constraint (declarative)
+
+- **Same-origin definition** (generalizing the existing "different backends"): members i and j are same-origin ⇔ `cli_i == cli_j` **or** `family_i == family_j` (family defaults to the `model` string). That is the equivalent form of the existing "different backends = different CLI and different model family", with unchanged semantics.
+- **Constraint**: ∀(i ∈ rev-capability members, j ∈ exec-capability members, i ≠ j): i and j **must not be same-origin**. The slot dimension is taken **by capability** — a composite slot like revtest participates in the rev set with its rev capability and in the exec set with its exec capability; i=j (self-pairing) does not enter here and is covered by the "self-review invalid" clause above.
+- **Conflict error wording (frozen, so that layers B/C/D speak with one voice)**:
+
+  > 组队冲突:槽位 <slotA>(<cliA>/<modelA>) 与槽位 <slotB>(<cliB>/<modelB>) 同源(共享 <CLI 名|模型族 X>):审了等于没审。请更换其中一端的 CLI 或模型族,或在声明中给两端标注不同 family。
+  >
+  > (Team conflict: slot <slotA> (<cliA>/<modelA>) and slot <slotB> (<cliB>/<modelB>) are same-origin (sharing <CLI name | model family X>): a review by one of the other is no review at all. Change the CLI or model family on one side, or annotate the two sides with different `family` values in the declaration.)
+
+### Naming rules (the key to many coexisting tabs)
+
+The actual agent name is **`<slot>-<task tag>`**, e.g. `orch-g07tune`. Why: herdr's **agent names are a global registry, unique across tabs and workspaces** (a clash is observed as `agent_name_taken`; a pane label is only a display label and carries no identity); the legal character set is `[a-z0-9_-]` only, ≤32. Members of the same tab share the tag; **the pane label stays identical to the agent name**.
+
+**Length**: check `len(slot)+1+len(tag) ≤ 32` **per slot** against the actual roster, and that the full name matches `^[a-z0-9_-]{1,32}$`; additionally give the static ceiling for the default vocabulary: the longest slot name is `revtest` (7 chars) → **tag ≤ 24**
+(tag ceiling = 32 (agent-name ceiling) − 1 (hyphen) − 7 (longest slot name `revtest`); **over-length is always rejected, never silently truncated** — truncation makes two tags collide, measured 2026-10-09).
+
+**The reuse check must exactly match the N full agent names against the JSON**, never a substring match like `grep -- "-<tag>"`: `herdr agent list` returns compact single-line JSON, and grep would take `g070` for `g07` and count some other task's whole line (measured 2026-10-09). See "Step 0" for the example. Members in other tabs do not count, and reuse across tasks never happens.
+
+## Step 0: bring up the panes (a fresh pane group, in its own tab)
+
+> The code block below is a **conceptual flow**, not a script to paste wholesale: execute it step by step, **check the return code at every step**, and stop immediately on any prerequisite failure (fail-fast). Always parse pane IDs out of the returned JSON, never copy them by hand; see the examples below. Before first use, do one manual end-to-end run: each CLI's login, repo trust confirmation and the first bypass-mode confirmation must not be left to an unattended window. **Write code-block syntax as Bash throughout** (parameter sets as arrays, `"${ARR[@]}"` expanding to one argv each; Zsh does not word-split an unquoted scalar and behaves differently, so do not copy them there directly).
 
 ```bash
 command -v herdr >/dev/null || { echo "herdr not installed, stop and tell the user"; exit 1; }
 [ "${HERDR_ENV:-}" = 1 ] || { echo "not running inside herdr, stop and tell the user"; exit 1; }
-herdr integration status           # whether each agent's status hook is installed: binary present but hook missing → status detection unreliable
-for a in kimi codex claude; do command -v $a >/dev/null && echo "$a ✓" || echo "$a missing → use substitute team assembly"; done
+herdr integration status           # is each agent's status hook installed: binary present but hook missing → status detection unreliable
 
-# ── Model gate (the first gate, before any command containing TAG, executed by the orchestrator = model) ──────────────
-# $tag has already been text-expanded into this document when the skill loads — the assignment line below is itself shell source code:
-# Writing the validation after the assignment cannot block text that enters the source code with $tag "before the assignment". The real first gate is
-# reading-based judgement: after reading the expanded value of $tag, first check that the whole string matches ^[a-z0-9_-]{1,19}$ (empty / spaces /
-# uppercase / over-long / newline are all illegal); if illegal, stop and ask the user to re-enter — do not type any line below, and do not
-# write the illegal value into any command. This is a model gate, not a shell gate; "assign first, validate afterwards" is not allowed.
-TAG=$tag                           # call argument: /skill:trio-orchestrate <tag> (the skill: prefix is required); if empty, wait for the user to name it when assigning the task. Once set it stays fixed for the whole run, and doubles as the tab label and the taskboard directory /tmp/<TAG>/
-# Second line of defense (shell level; it blocks continued use after the assignment, and cannot replace the model gate above): whole-string validation
-# (measured 2026-10-09: $'g07\n../outside' slips through the old grep -qE line anchoring; bash [[ =~ ]] on the whole string rejects it)
-[[ "$TAG" =~ ^[a-z0-9_-]{1,19}$ ]] || { echo "TAG invalid (empty / contains characters outside [a-z0-9_-] / over 19 characters / contains a newline), reject and ask the user to re-enter"; exit 1; }
-# 19 = 32 (agent name ceiling) − 13 (length of the codex-review- prefix); anything over-long is always rejected, never silently truncated (truncation makes two tags collide, measured 2026-10-09)
+# ── Model gate (the first gate, ahead of any command containing $tag/$roster; executed by the orchestrator = the model) ──
+# $tag and $roster were already textually expanded into this document when the skill loaded — those two assignment lines below
+# are themselves shell source: a check written after the assignment cannot stop text that entered the source *before* it.
+# The real first gate is the reading judgement: after reading the expanded values, first verify that the whole TAG string matches
+# ^[a-z0-9_-]{1,24}$ and the whole ROSTER string matches the DSL regex below (an empty member / empty segment / :: / uppercase /
+# space / newline is all illegal); if illegal, stop and ask the user for a new one — do not type any line below, and do not write
+# the illegal value into any command. This is a model gate, not a shell gate; "assign first, validate later" is not allowed.
+# If the roster did not arrive (the engine may return only the first argument; behaviour [not tested]) → degrade per R2: ask the
+# user face to face for the roster declaration, and put the string through the same model gate + shell validation before
+# continuing; both sources are treated alike, and the protocol does not fork.
+TAG=$tag                           # invocation parameter: /skill:trio-orchestrate <tag> <roster> (the skill: prefix is required); if empty, wait for the user to name it when assigning the task. Fixed for the whole run, and used both as the tab label and as the taskboard directory /tmp/<TAG>/
+ROSTER=$roster                     # second parameter; if empty → use the default declaration (see "Slots and roster declaration")
+[ -n "$ROSTER" ] || ROSTER='orch=kimi+rev=codex:gpt-6.1-sol:high+exec=claude'
+# Second line of defence (shell layer, stopping continued use after the assignment; it cannot replace the model gate above):
+# whole-string validation (measured 2026-10-09: $'g07\n../outside' passes the old grep -qE line anchoring; bash [[ =~ ]] on the
+# whole string rejects it)
+[[ "$TAG" =~ ^[a-z0-9_-]{1,24}$ ]] || { echo "TAG illegal (empty / chars outside [a-z0-9_-] / longer than 24 / contains a newline), reject and ask the user for a new one"; exit 1; }
+[[ "$ROSTER" =~ ^[a-z0-9]+=[a-z0-9_.-]+(:[a-z0-9_.-]+){0,3}(\+[a-z0-9]+=[a-z0-9_.-]+(:[a-z0-9_.-]+){0,3})*$ ]] \
+  || { echo "ROSTER illegal (empty member / empty segment / :: / uppercase / space / newline), reject and ask the user for a new one"; exit 1; }
+# The regex rejects empty members (two `+` in a row), empty segments (nothing after `=`), `::`, uppercase, spaces and newlines; at most 4 segments per member (slot=cli:model:effort:family)
 
-# ── Task directory: classify before taking the lock, fix the path plan first; never overwrite unconditionally ──────────────────────
-# Order (ruling N3, 2026-10-09): create the directory → directory/file safety check → fix the path plan → classify (new / reentry / resume)
-#   → only if the classification passes, take the exclusive lock → create/verify the manifest.
-# Do not take the lock before classifying: the freshly taken lock itself makes the directory non-empty, so a legitimate new launch would be killed as "non-empty and no manifest" (self-blocking).
-# Exclusivity: one TAG allows only one launch flow at a time (concurrently sharing the ACK file is itself not allowed); the lock is released after the launch completes (ACK passes),
-# if it stops on a mid-way failure, do not delete the lock yet — finish the manual handling first, then delete the lock and re-enter, to prevent accidental reentry
-# ══ First-run flow block (start): extract this whole block, set TAG and PWD (the project root cwd), and it runs standalone ══
+# ── roster structural validation (after parsing, one python step, stop on failure) ──
+# In order: ① slot name ∈ vocabulary, no duplicates within one roster; ② N ≥ 2; ③ capability coverage orch≥1/rev≥1/exec≥1;
+# ④ exactly one orchestrator (orch exactly 1); ⑤ pairwise constraint enumeration (rev capability × exec capability, not same-origin);
+# ⑥ every member's full name matches ^[a-z0-9_-]{1,32}$ and is ≤32; ⑦ cli ∈ this machine's backend-profile table (see "Backend profiles";
+# an unknown CLI → "no profile, add a backend profile before launching").
+# On success it prints the normalized roster string (slot order fixed: orch always first, the rest in declaration order), which is
+# written into the manifest's roster: line and into the bootstrap, so the expected set can be rebuilt on re-entry.
+ROSTER_NORM=$(python3 - "$ROSTER" "$TAG" <<'PY'
+import re, sys
+CAPS = {"orch": {"orch"}, "rev": {"rev"}, "rev2": {"rev"}, "revtest": {"rev", "exec"}, "exec": {"exec"}}
+for _i in range(2, 10):
+    CAPS[f"exec{_i}"] = {"exec"}                       # exec2…exec9: ten additional execution lines
+KNOWN_CLI = {"kimi", "codex", "claude", "copilot", "opencode", "genox"}   # this machine's backend-profile table; keep in sync when adding profiles
+roster, tag = sys.argv[1], sys.argv[2]
+full = re.compile(r"^[a-z0-9_-]{1,32}$")
+members = []
+for part in roster.split("+"):
+    seg = part.split(":")
+    slot, cli = seg[0], seg[1]
+    model = seg[2] if len(seg) > 2 else ""
+    effort = seg[3] if len(seg) > 3 else ""
+    family = seg[4] if len(seg) > 4 else model      # family defaults to the model string
+    members.append(dict(slot=slot, cli=cli, model=model, effort=effort, family=family, caps=CAPS[slot]))
+# ① no duplicate slots
+slots = [m["slot"] for m in members]
+if len(set(slots)) != len(slots):
+    sys.exit(f"roster 槽位重复:{slots}")
+# ② N ≥ 2
+if len(members) < 2:
+    sys.exit(f"编队至少 2 名成员(实得 {len(members)})")
+# ③ capability coverage
+for cap in ("orch", "rev", "exec"):
+    if not any(cap in m["caps"] for m in members):
+        sys.exit(f"编队缺少 {cap} 能力:每个 roster 必须有 orch ≥1、rev ≥1、exec ≥1")
+# ④ exactly one orchestrator
+if sum(1 for m in members if "orch" in m["caps"]) != 1:
+    sys.exit("必须单编排:orch 槽位恰好一个")
+# ⑤ pairwise constraint: rev capability × exec capability must not be same-origin (a composite slot's self-pairing is skipped, see "self-review invalid")
+revs = [m for m in members if "rev" in m["caps"]]
+execs = [m for m in members if "exec" in m["caps"]]
+for i in revs:
+    for j in execs:
+        if i["slot"] == j["slot"]:
+            continue
+        if i["cli"] == j["cli"] or (i["family"] and i["family"] == j["family"]):
+            shared = f"CLI 名 {i['cli']}" if i["cli"] == j["cli"] else f"模型族 {i['family']}"
+            sys.exit(
+                f"组队冲突:槽位 {i['slot']}({i['cli']}/{i['model']}) 与槽位 "
+                f"{j['slot']}({j['cli']}/{j['model']}) 同源(共享 {shared}):审了等于没审。"
+                f"请更换其中一端的 CLI 或模型族,或在声明中给两端标注不同 family。")
+# ⑥ full-name length and character set
+for m in members:
+    name = f"{m['slot']}-{tag}"
+    if len(name) > 32 or not full.match(name):
+        sys.exit(f"agent 全名不合法或超 32:{name}")
+# ⑦ CLI has a profile
+for m in members:
+    if m["cli"] not in KNOWN_CLI:
+        sys.exit(f"CLI {m['cli']} 无档案,先补后端档案再拉起")
+order = {"orch": 0}
+members.sort(key=lambda m: (order.get(m["slot"], 1), slots.index(m["slot"])))
+out = []
+for m in members:
+    seg = [f"{m['slot']}={m['cli']}"]
+    if m["model"]:
+        seg.append(m["model"])
+        if m["effort"]:
+            seg.append(m["effort"])
+            if m["family"] and m["family"] != m["model"]:
+                seg.append(m["family"])
+    out.append(":".join(seg))
+print("+".join(out))                                # stdout prints exactly one line: the normalized roster string
+PY
+) || { echo "roster structural validation failed: stop, fix per the error above, then launch"; exit 1; }
+echo "normalized roster: $ROSTER_NORM"
+
+# ── Task directory: classify before taking the lock, fix the path plan first; never overwrite unconditionally ──
+# Order (verdict N3, 2026-10-09): create directory → directory/file safety check → fix the path plan → classify
+#   (new / re-entry / resume) → only if classification passes, take the exclusive lock → create/verify the manifest.
+# Do not take the lock before classifying: the freshly taken lock itself makes the directory non-empty, and a legitimate new
+# launch gets killed as "non-empty and no manifest" (self-blocking).
+# Exclusivity: one TAG allows only one launch flow at a time (concurrent sharing of the ACK file is itself disallowed); the
+# lock is released once the launch completes (ACK passed). If it fails midway, do not delete the lock yet — handle it by hand,
+# then delete the lock and re-enter, to prevent an accidental re-entry.
+# ══ First-run flow block (begin; protocol version 2026-10-10-r6): lift this whole block out, set TAG/ROSTER/ROSTER_NORM and PWD (the project-root cwd), and it runs standalone ══
 TD="/tmp/$TAG"                                          # task directory (state directory); this block always uses $TD
 mkdir -p "$TD"                                          # idempotent
 
-# Directory/file safety: check every path read or written — not a symlink (`[ -L ]`), owner is yourself; a non-existent path counts as creatable
+# Directory/file safety: check every path read or written — not a symlink (`[ -L ]`), owned by yourself; a non-existent path counts as creatable
 guard() {
   [ -e "$1" ] || [ -L "$1" ] || return 0
   [ -L "$1" ] && { echo "reject: $1 is a symlink (it may point outside the task directory)"; return 1; }
   [ "$(stat -c %u -- "$1" 2>/dev/null)" = "$(id -u)" ] || { echo "reject: $1 is not owned by the current user"; return 1; }
   return 0
 }
-for p in "$TD" "$TD/manifest.txt" "$TD/taskboard.md" "$TD/bootstrap.md" "$TD/bootstrap-ack.md" "$TD/ack-expected" "$TD/mode-selection.md"; do
+for p in "$TD" "$TD/manifest.txt" "$TD/taskboard.md" "$TD/bootstrap.md" "$TD/bootstrap-ack.md" "$TD/ack-expected" "$TD/mode-selection.md" "$TD/panes.txt"; do
   guard "$p" || { echo "task directory/file safety check failed: stop for manual confirmation"; exit 1; }
 done
 
 ROOT=$(realpath -m "$PWD")                              # canonical absolute project root: the anchor of task identity
-# The path plan is fixed before the manifest is generated (this is not "compute the sibling worktrees first, then reject the non-git fallback the body allows"):
-#   git repo → the three role cwds = main tree + two sibling worktrees; non-git → all three cwds record the main tree (allowed only in attended mode)
+# Slot order is fixed: orch always first, the rest in roster declaration order — the manifest's cwd lines, the ACK lines and
+# panes.txt all follow it
+SLOTS=$(python3 -c 'import sys;print(" ".join(p.split("=")[0].split(":")[0] for p in sys.argv[1].split("+")))' "$ROSTER_NORM")
+N=$(echo $SLOTS | wc -w)
+# The path plan is fixed before the manifest is generated (not "compute sibling worktrees first, then reject the non-git fallback
+# the document allows"):
+#   git repo → the orch slot's cwd = the main tree, and every non-orch slot gets a sibling worktree; non-git → all N cwds record
+#   the main tree (allowed only in attended mode)
 if git -C "$PWD" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
   PATH_PLAN=worktree
-  EXPECT_ORCH=$(realpath -m "$PWD")
-  EXPECT_REVIEW=$(realpath -m "$PWD/../wt-$TAG-review")
-  EXPECT_EXEC=$(realpath -m "$PWD/../wt-$TAG-exec")
 else
   PATH_PLAN=main-only
-  EXPECT_ORCH=$(realpath -m "$PWD"); EXPECT_REVIEW="$EXPECT_ORCH"; EXPECT_EXEC="$EXPECT_ORCH"
 fi
+# Per-slot expected path: under the git plan orch = the main tree and the rest = ../wt-$TAG-<slot>; under the non-git plan all = the main tree
+EXPECT_MAIN=$(realpath -m "$PWD")
+expect_of() {                                            # $1 = slot
+  if [ "$PATH_PLAN" = worktree ] && [ "$1" != orch ]; then
+    realpath -m "$PWD/../wt-$TAG-$1"
+  else
+    echo "$EXPECT_MAIN"
+  fi
+}
 
-# ① Classify: read-only judgement, write nothing yet
+# ① Classify: a read-only judgement, writing nothing yet
 if [ -s "$TD/manifest.txt" ]; then
   CLASSIFY=reentry
 elif [ -n "$(ls -A "$TD" 2>/dev/null)" ]; then
-  echo "$TD is non-empty and has no manifest (leftovers, a lock from a concurrent launch, or another task): stop for manual confirmation, do not auto-clean"; exit 1
+  echo "$TD is non-empty and has no manifest (leftovers, a lock from a concurrent launch, or another task): stop for manual confirmation, do not clean up automatically"; exit 1
 else
-  CLASSIFY=new                                          # empty directory → legitimate new launch
+  CLASSIFY=new                                          # empty directory → a legitimate new launch
 fi
-# ② Only after the classification passes, take the exclusive lock
-mkdir "$TD/launch.lock" 2>/dev/null || { echo "a launch flow is already running (launch.lock): no concurrent launch, stop"; exit 1; }
+# ② Classification passed, only now take the exclusive lock
+mkdir "$TD/launch.lock" 2>/dev/null || { echo "a launch flow is already running (launch.lock): no concurrent launches, stop"; exit 1; }
 
-# ③ Per the classification, create the manifest / verify task identity
+# ③ By classification: create the manifest / verify task identity
 if [ "$CLASSIFY" = reentry ]; then
-  # Reentry: **unique parse** of the manifest — required fields (tag / project-root / the three cwd lines / created / bootstrap-id)
-  # exactly one line each with a non-empty value; a field name appearing twice is rejected (contradictory values do not count as "field-by-field agreement"); one cwd line per role, compared by realpath
-  _mout=$(python3 - "$TAG" "$ROOT" "$EXPECT_ORCH" "$EXPECT_REVIEW" "$EXPECT_EXEC" "$TD/manifest.txt" <<'PY'
+  # Re-entry: the manifest **unique parse** — required fields (tag / roster / project-root / created / bootstrap-id)
+  # each exactly one line with a non-empty value; a field name appearing twice is a rejection (contradictory values do not count
+  # as "consistent field by field");
+  # cwd line count == N, the cwd slot set == the roster line's slot set, and a per-slot realpath comparison.
+  # N is read from the roster line (no second parse in shell); the expected paths are computed per slot by this process from the
+  # path plan and passed in, and both sides are normalized with realpath before comparing. stdout emits exactly N verified paths
+  # in fixed slot order, for the shell to read back line by line.
+  _mout=$(python3 - "$TAG" "$ROOT" "$TD/manifest.txt" "$SLOTS" $(for s in $SLOTS; do echo "$s"; echo "$(expect_of "$s")"; done) <<'PY'
 import os, sys
-tag, root, eo, er, ee, path = sys.argv[1:7]
-want_cwd = {f"kimi-orch-{tag}": eo, f"codex-review-{tag}": er, f"claude-exec-{tag}": ee}
+tag, root, path, slots = sys.argv[1:5]
+rest = sys.argv[5:]
+want = dict(zip(rest[0::2], rest[1::2]))
 seen = {}
 for line in open(path, encoding="utf-8"):
     line = line.rstrip("\n")
     if not line:
         continue
     if ":" not in line:
-        sys.exit(f"unparseable manifest line: {line!r}")
+        sys.exit(f"manifest 无法解析的行:{line!r}")
     k, v = line.split(":", 1)
     if not v.strip():
-        sys.exit(f"manifest field {k} has an empty value")
+        sys.exit(f"manifest 字段 {k} 值为空")
     seen.setdefault(k, []).append(v.strip())
-def one(k):                                             # a required field must be exactly one line; a duplicate is a conflict
+def one(k):                                             # a required field is exactly one line; a duplicate is a conflict
     vs = seen.get(k, [])
     if len(vs) != 1:
-        sys.exit(f"manifest field {k} should be exactly one line (got {len(vs)})")
+        sys.exit(f"manifest 字段 {k} 应恰好一行(实得 {len(vs)})")
     return vs[0]
-if one("tag") != tag: sys.exit("tag mismatch")
-if one("project-root") != root: sys.exit("project-root mismatch")
+if one("tag") != tag: sys.exit("tag 不符")
+if one("project-root") != root: sys.exit("project-root 不符")
 one("created"); one("bootstrap-id")                     # present, exactly one line, non-empty value
+roster = one("roster")                                  # the roster line: required, exactly one line, non-empty
+rslots = [p.split("=")[0].split(":")[0] for p in roster.split("+")]
+if rslots[0] != "orch": sys.exit(f"roster 行槽位序不合法(orch 必须第一):{roster!r}")
+if rslots != slots:
+    sys.exit(f"roster 行槽位集合与本次不符:{rslots} ≠ {slots}")
 cwds = seen.get("cwd", [])
-if len(cwds) != 3: sys.exit(f"there should be exactly three cwd lines (got {len(cwds)})")
+if len(cwds) != len(slots):
+    sys.exit(f"cwd 行数应 == N = {len(slots)}(实得 {len(cwds)})")
 got = {}
 for v in cwds:
     name, sep, p = v.partition(" ")
-    if sep != " " or not p.strip(): sys.exit(f"cwd line is missing its separator or the path is empty: {v!r}")
-    if name in got: sys.exit(f"cwd role {name} is duplicated")
+    if sep != " " or not p.strip(): sys.exit(f"cwd 行缺分隔符或路径为空:{v!r}")
+    if name in got: sys.exit(f"cwd 槽位 {name} 重复")
     got[name] = p.strip()
-if set(got) != set(want_cwd): sys.exit("the set of cwd roles does not match this run")
-for name, exp in want_cwd.items():
-    if os.path.realpath(got[name]) != os.path.realpath(exp):
-        sys.exit(f"{name} cwd={got[name]} ≠ expected {exp} (still different after realpath normalization)")
-print("manifest unique parse passed: no duplicate fields, no empty values, the three role cwds match this run", file=sys.stderr)
-for _n in (f"kimi-orch-{tag}", f"codex-review-{tag}", f"claude-exec-{tag}"):
-    print(got[_n])                                  # stdout emits only the three verified paths (fixed order) for the shell to read back line by line
+if set(got) != set(slots): sys.exit("cwd 槽位集合与 roster 行不符")
+if [k for k in got] != slots: sys.exit("cwd 行序与槽位固定序不符")
+for name in slots:
+    if os.path.realpath(got[name]) != os.path.realpath(want[name]):
+        sys.exit(f"{name} cwd={got[name]} ≠ 预期 {want[name]}(realpath 规范化后仍不同)")
+print("manifest 唯一解析通过:字段无重复、值非空,roster 行与 N 个槽位 cwd 与本次一致", file=sys.stderr)
+for name in slots:
+    print(got[name])                                    # stdout emits exactly N verified paths (fixed slot order), for the shell to read back
 PY
-  ) || { echo "manifest does not match this run (duplicate field / empty value / project root / role path / missing path): not recognized as this task, stop for manual confirmation"; exit 1; }
-  # The expected cwds are emitted directly by the same parser above (reentry does not reassemble paths or parse a second time — an earlier awk re-parse had field semantics that drifted from the manifest line format and blanked all three EXPECTs, 2026-10-09 N4); read them back line by line and guard against empty values
-  { IFS= read -r EXPECT_ORCH; IFS= read -r EXPECT_REVIEW; IFS= read -r EXPECT_EXEC; } <<< "$_mout"
-  [ -n "$EXPECT_ORCH" ] && [ -n "$EXPECT_REVIEW" ] && [ -n "$EXPECT_EXEC" ] || { echo "an expected cwd read back on reentry is empty: stop for manual confirmation"; exit 1; }
-  echo "reentry: manifest unique parse agrees, reuse the existing taskboard, fill gaps only, never overwrite"
+  ) || { echo "manifest does not match this run (duplicate field/empty value/project root/roster/slot path/missing path): not recognized as this task, stop for manual confirmation"; exit 1; }
+  # The expected cwds were verified by the same parser with the same algorithm above (re-entry does not re-assemble the path plan
+  # and does not parse a second time — the awk second parse once drifted from the manifest line format, blanking all three EXPECT
+  # values, 2026-10-09 N4); read them back line by line and guard against empty values
+  EXPECT_MAIN=$(echo "$_mout" | sed -n '1p')
+  i=0; for s in $SLOTS; do i=$((i+1)); eval "EXPECT_$(echo $s | tr a-z A-Z)=$(echo "$_mout" | sed -n "${i}p")"; done
+  for s in $SLOTS; do eval "v=\$EXPECT_$(echo $s | tr a-z A-Z)"; [ -n "$v" ] || { echo "the re-entry read-back expected cwd for slot $s is empty: stop for manual confirmation"; exit 1; }; done
+  echo "re-entry: manifest unique parse consistent, reusing the existing taskboard, filling gaps only, never overwriting"
 else
-  CREATE_ID=$(date +%s)-$RANDOM                         # directory-creation batch id: part of task identity, taken only on a new launch
-  cat > "$TD/manifest.txt" <<EOF
-tag: $TAG
-project-root: $ROOT
-cwd: kimi-orch-$TAG $EXPECT_ORCH
-cwd: codex-review-$TAG $EXPECT_REVIEW
-cwd: claude-exec-$TAG $EXPECT_EXEC
-created: $(date -Is)
-bootstrap-id: $CREATE_ID
-EOF
-  echo "new: task directory initialized (path plan $PATH_PLAN; lock taken, released after the ACK passes)"
+  CREATE_ID=$(date +%s)-$RANDOM                         # directory creation batch id: part of task identity, taken only on a new launch
+  {
+    echo "tag: $TAG"
+    echo "roster: $ROSTER_NORM"
+    echo "project-root: $ROOT"
+    for s in $SLOTS; do                                  # N lines, fixed slot order (orch always first)
+      echo "cwd: $s-$TAG $(expect_of "$s")"
+    done
+    echo "created: $(date -Is)"
+    echo "bootstrap-id: $CREATE_ID"
+  } > "$TD/manifest.txt"
+  echo "new: task directory initialized (path plan $PATH_PLAN; lock held, released once the ACK passes)"
 fi
 # ══ First-run flow block (end) ══
 
-# Reuse check: exact JSON matching of the three full agent names; then verify each role's cwd == that role's **expected cwd** (git plan = that line's worktree;
-# non-git fallback = the main tree) — the expected values always come from the manifest above
-# (it is not a requirement that the three cwds be equal — the three sharing a tab but wrongly running in another directory still cannot be reused); the expected paths come from the manifest above,
-# and both sides are compared after realpath normalization — a path built with .. and the canonical cwd pointing at the same directory must compare equal, otherwise a normal reentry would be misjudged;
-# if either tab_id or workspace_id is missing, exit non-zero (fail-closed); "it managed to print a conclusion" does not count as passing
+# Reuse check: exactly match N full agent names against the JSON; then check each slot's cwd == that slot's **expected cwd**
+# (under the git plan = that slot's worktree; the non-git fallback = the main tree) — expected values always come from the
+# manifest above
+# (not "require every slot's cwd to be equal" — same tab but having wandered into another directory still cannot be reused);
+# both sides are compared after realpath normalization — a path with `..` and a canonical cwd that point at the same directory
+# must compare equal, or a normal re-entry would be misjudged;
+# a missing tab_id/workspace_id exits non-zero (fail-closed); "it printed a conclusion" is not a pass
 herdr agent list | python3 -c '
 import json,os,sys
 agents=json.load(sys.stdin)["result"]["agents"]
-tag,main,wt_review,wt_exec=sys.argv[1:5]
-expect={f"kimi-orch-{tag}":main, f"codex-review-{tag}":wt_review, f"claude-exec-{tag}":wt_exec}
+tag=sys.argv[1]; slots=sys.argv[2].split(); paths=sys.argv[3:]
+expect={f"{s}-{tag}": p for s,p in zip(slots,paths)}
 def norm(p):
     return os.path.realpath(p) if p else p
 got={a.get("name"):a for a in agents}
 missing=[w for w in expect if w not in got]
 if missing:
-    print("missing: "+", ".join(missing)); sys.exit(2)
+    print("缺: "+", ".join(missing)); sys.exit(2)
 def bad(msg):
     print(msg); sys.exit(3)
 for w,exp in expect.items():
     a=got[w]
     if not a.get("tab_id") or not a.get("workspace_id"):
-        bad(w+" is missing tab_id/workspace_id, fail-closed: do not reuse")
+        bad(w+" 缺 tab_id/workspace_id,fail-closed:不复用")
     cwd=a.get("cwd")
     if norm(cwd)!=norm(exp):
-        bad(w+" cwd="+str(cwd)+" ≠ expected worktree="+str(exp)+" (still different after realpath normalization): do not reuse")
+        bad(w+" cwd="+str(cwd)+" ≠ 预期 worktree="+str(exp)+"(realpath 规范化后仍不同):不复用")
 tabs={got[w].get("tab_id") for w in expect}
 if len(tabs)!=1:
-    bad("the three-piece set is not in the same tab: "+", ".join(w+"@"+str(got[w].get("tab_id")) for w in expect))
-print("three-piece set complete: same tab, and each cwd matches its expected worktree (after realpath normalization)")' "$TAG" "$EXPECT_ORCH" "$EXPECT_REVIEW" "$EXPECT_EXEC"
-# Exit codes: 0 = reusable; 2 = a role is missing (fill in only the missing ones); 3 = topology/directory mismatch or a missing field (fail-closed, do not auto-reuse; rebuild after manual confirmation)
-# The expected cwds always come from the manifest: on a new launch they are written from the path plan fixed in the "first-run flow block" (git → main tree + two sibling worktrees;
-# non-git → all three cwds record the main tree, allowed only in attended mode); on reentry they are extracted by the unique parse — here the three expected paths are passed to the reuse check
+    bad("成员不在同一 tab: "+", ".join(w+"@"+str(got[w].get("tab_id")) for w in expect))
+print(f"{len(expect)} 名成员齐全:同 tab,且各自 cwd 与预期 worktree 一致(realpath 规范化后)")' \
+  "$TAG" "$SLOTS" $(for s in $SLOTS; do eval "echo \$EXPECT_$(echo $s | tr a-z A-Z)"; done)
+# Exit codes: 0 = reusable; 2 = members missing (create only those); 3 = topology/directory mismatch or missing fields
+# (fail-closed, do not reuse automatically, rebuild after manual confirmation)
+# Expected cwds always come from the manifest: on a new launch they are written per the path plan fixed in the "first-run flow
+# block" (git → the main tree + N−1 sibling worktrees; non-git → all N cwds record the main tree, allowed only in attended
+# mode), and on re-entry they are read back through the unique parse — here the N expected paths are passed to the reuse check
 ```
 
 ### Mode selection (after detection, before launch — mandatory)
 
-**The startup parameters are the result of mode selection, not defaults; starting without doing mode selection = a process violation.** The task directory, the manifest (project root / each role's expected cwd / creation time / bootstrap ID) and the exclusive lock have already been handled in the "detection" step above; this step verifies the three enablement gates of "unattended mode" one by one, and each one leaves evidence in `/tmp/$TAG/mode-selection.md` (evidence that cannot be written clearly = that gate fails). Once the taskboard is created, paste a pointer to that file into it:
+**Launch parameters are the outcome of mode selection, not defaults; launching without having done mode selection is a process violation.** The task directory, the manifest (project root / each slot's expected cwd / roster / creation time / bootstrap ID) and the exclusive lock were already handled in the "detection" step above; this step checks the three unattended-mode enabling gates one by one, each documenting its evidence in `/tmp/$TAG/mode-selection.md` (evidence you cannot write down = that gate fails), and once the taskboard exists its pointer goes into the board:
 
-| Gate | What is verified (not just "a protection flag exists") | What the evidence records |
+| Gate | What is actually checked (not merely "a protection flag exists") | What the evidence says |
 |---|---|---|
-| 1 Push boundary | ① **the execution identity itself has no bypass permission** (both direct pushes by remote admins and the bypass list of the protection rules must be checked); ② the target ref (main/master) is actually covered by protection rules; ③ other branches that are allowed to be pushed also cannot be force-pushed | the actual branch protection settings (e.g. `gh api repos/<owner>/<repo>/branches/main/protection` to see `enforce_admins` and the rules), or read-only evidence from the credential side; if it cannot be verified → fail |
-| 2 Credential surface | record **which execution instance** (the claude-exec-$TAG process), **which credentials are required** (keep only each CLI's own login state), the **list of sensitive paths** (mount points, readable directories), and the isolation method (separate Unix user / container / not mounting) | a minimal verifiable isolation configuration + mount list; a container existing ≠ no sensitive data mounted, a separate user name ≠ files unreadable — write it out item by item |
-| 3 Directory and permission scope | **worktree availability and the process's permission scope are verified separately**: a worktree isolates only working files and the index, and cross-directory writes by the same Unix user are not constrained by it (see "Known limitations" item 3) | ① it is a git repository and a worktree can be created; ② the process's write boundary: there is a restricted scope such as a container / separate user, **or the user explicitly chose the "allow same-user cross-directory access" authorization scope** (if chosen, restate unattended item 3 as that chosen scope, and stop claiming that crossing directories always requires confirmation); if no restricted scope can be verified and no explicit choice was made → fail |
+| 1 Push boundary | ① **The pushing identity itself has no bypass rights** (both admin direct pushes and protection-rule bypass lists must be checked); ② the target ref (main/master) is actually covered by a protection rule; ③ other branches that allow pushes must not allow force-push either | The actual branch-protection settings (e.g. `gh api repos/<owner>/<repo>/branches/main/protection` for `enforce_admins` and the rules), or credential-side read-only evidence; if it cannot be verified → fail |
+| 2 Credential surface | **Verified per member against the process list**: each member's full agent name + process (argv/pid) + required credentials (only each CLI's own login state) + readable sensitive paths + isolation means (separate Unix user / container / no mounts) | The minimal verifiable isolation config + mount list; a container existing ≠ no sensitive data mounted, a separate user name ≠ files unreadable — write each one down |
+| 3 Directory and permission scope | **Worktree availability and process permission scope are accepted separately**: a worktree isolates only working files and the index, and the same Unix user is not constrained by it when writing across directories (see "Known limitations" item 3). Under the git plan the worktree count = N−1 (orch uses the main tree, every non-orch slot gets one); non-git → all cwds = the main tree | ① It is a git repo and N−1 worktrees can be created; ② the process's write boundary: a restricted scope such as a container/separate user, **or the user explicitly choosing "same-user cross-directory access" as the authorized scope** (if chosen, restate unattended item 3 as that chosen scope and stop claiming cross-directory always confirms); no restricted scope and no explicit choice → fail |
 
-All three gates pass → **unattended parameter set**; any gate fails → **attended parameter set**, and state on the taskboard which gate failed and what evidence failed:
+All three gates pass → the **unattended parameter set**; any failure → the **attended parameter set**, and the taskboard states which gate failed and on what evidence. **The two rows of parameter sets as a per-CLI table live in "Backend profiles"**; each member's launch parameters are looked up there by that member's CLI, not hard-coded here.
 
-| Parameter set | kimi-orch | codex-review | claude-exec |
-|---|---|---|---|
-| Unattended parameter set (all three gates pass) | `--auto` | `--approve-for-me` | `--dangerously-skip-permissions --settings ${KIMI_SKILL_DIR}/claude-exec-deny.json` |
-| Attended parameter set (any gate fails) | no `--auto` (its semantics are Never Ask, see below) | **explicit** `-a on-request -c approvals_reviewer=user` (inheritance is not accepted: omitting the flag ≠ manual approval — this machine's user config was measured to contain `approval_policy = "never"`; the approver is decided separately by `approvals_reviewer`) | **explicit** `--permission-mode default` (from ≥2.1.283, not passing bypass may still inherit auto or the user's `permissions.defaultMode` setting, **inheritance is not accepted**) + `--settings` (deny only tightens, never loosens); after startup, verify the real mode |
+The failure branch is not "launch with the permissive flags anyway and note it on the board":
 
-```bash
-# The parameter sets use Bash arrays (all code blocks in this skill are Bash-only; eval is forbidden — quote characters must not be stuffed into a string expecting a second round of parsing.
-# Building argv by string concatenation is wrong: Bash splits on spaces, so a path with a space breaks the --settings path into two items;
-# Zsh is worse — scalars are not split automatically at all, so the whole set becomes one argument. Measured 2026-10-09, two modes × two shells × eight samples)
-# (a) unattended parameter set — all three gates pass
-KIMI_ARGS=(--auto)
-CODEX_ARGS=(--approve-for-me)
-CLAUDE_ARGS=(--dangerously-skip-permissions --settings "${KIMI_SKILL_DIR}/claude-exec-deny.json")
-# (b) attended parameter set — any gate fails; replace the three lines above with (codex explicit policy + approver: see the acceptance item under "Mode selection"):
-# KIMI_ARGS=(); CODEX_ARGS=(-a on-request -c approvals_reviewer=user); CLAUDE_ARGS=(--permission-mode default --settings "${KIMI_SKILL_DIR}/claude-exec-deny.json")
-# An empty array "${KIMI_ARGS[@]}" expands to nothing (safe; it does not become an empty-string argument)
-```
+- Gate 1 fails → **the push ban for every exec-capability member must be enforced as a capability**: that member's instance holds no push credential, or the remote grants restricted write access to line branches only; writing "push banned" on the board does not count;
+- Gate 2 fails → **do not issue the bypass/auto launch command**; switch to the attended parameter set (given explicitly per CLI profile, see "Backend profiles");
+- Gate 3 fails (non-git / no restricted permission scope) → same as above, fall back to attended mode, with the human as the backstop.
 
-The failure branches are not "keep the permissive parameters as before and just write one line on the taskboard":
+**The attended set means "explicit manual mode + acceptance", not "omit the flag":**
 
-- Gate 1 fails → **banning push on the execution line must be enforced by capability**: the execution instance does not hold push credentials, or the remote grants only restricted write permission on the line's branch; writing "push banned" on the taskboard alone does not count;
-- Gate 2 fails → **do not issue the bypass/auto startup commands**; switch to the attended parameter set (claude **explicitly** `--permission-mode default`, codex **explicitly** `-a on-request -c approvals_reviewer=user`);
-- Gate 3 fails (non-git / no restricted permission scope) → same as above, fall back to attended mode with a human as the backstop.
+- Give it **explicitly** per that CLI's profile, and never accept inherited machine defaults (reasons and measurements are in the corresponding CLI entries under "Backend profiles"); after launch, **accept the real mode**: `herdr pane read <that slot's pane>` to see the status bar, or have that agent run `/status` to confirm it is currently manually approving (neither bypass nor auto), and record the evidence in `mode-selection.md`; **if the manual mode cannot be verified, that gate has failed — stop dispatching**, troubleshoot first or stop and relaunch, never dispatch into an unknown mode;
+- **An existing session does not take launch parameters**: the permission mode is a property of the process — changing a shell variable or a taskboard note does not change an already running process. If the target agent is already running when a gate fails (especially already inside bypass/auto), you **must stop it first (exit/kill) and relaunch it in the manual mode**, and only resume dispatching after re-verifying the mode; "changed a variable, so consider it downgraded" is not allowed;
+- The orch-slot exception is closed off (that "the current session acts as orchestrator" exception at the end of Step 0): the semantics of `--auto` is **Never Ask** — it does not interrupt the user, it executes automatically and decides automatically; the user sitting at the terminal = a human present, but **being present ≠ the user approving**, and rename only registers identity — it neither changes the CLI's permission mode nor makes the CLI wait for a nod before acting. When the current session is already running inside `--auto` and the three gates fail, only two options are allowed: **(a) documented narrowing (not equivalent to human approval)**: the user writes the authorized scope explicitly into `/tmp/$TAG/mode-selection.md` (which operations may run automatically, how supervision and stopping work), and that branch then runs characterized as "**authorized automatic execution + human supervision**", labelled truthfully, and never again claims equivalence to human approval; **(b) no such record → stop work**. If you want actions to genuinely wait for human approval beforehand, you need a separate external dispatch/execution approval gate (this skill has no built-in layer for that).
 
-**The attended set is "explicit manual mode + acceptance", not "omitting the flags":**
-
-- From claude ≥2.1.283, not passing bypass may still inherit auto or the user's configured default mode — so manual approval must be chosen explicitly; after startup, **verify the real mode**: `herdr pane read "$P2"` to look at the status line, or have claude run `/status` to confirm it is currently manual approval (not bypass and not auto), with the evidence recorded in `mode-selection.md`; **if manual mode cannot be verified = the gate failed, stop dispatching**, troubleshoot first or stop and start over — never dispatch work under an unknown mode;
-- codex **must be given the approval policy and approver explicitly**: `-a on-request -c approvals_reviewer=user` — omitting the flag inherits this machine's user config, which is not the same as manual approval (on this machine, the user-level `.codex/config.toml` was measured to contain `approval_policy = "never"`: it never asks the user for approval; the approver is decided separately by `approvals_reviewer`, and only `user` asks a person); **on-request does not mean every command asks a person** — it means "it asks when the model actively requests it"; to have every batch of actions released by a person first, you need a separate dispatch gate (the orchestrator waits for the user's nod per task before sending); after startup, use `herdr pane read` to check the approval policy and approver shown in the status line / session header, record the evidence in `/tmp/$TAG/mode-selection.md`, and if it cannot be verified, stop and do not dispatch;
-- **Existing sessions are not subject to startup parameters**: the permission mode is a process-level property — changing a shell variable or a taskboard entry does not change an already running process. If a gate fails and the target agent is already running (especially already inside bypass/auto), **it must be stopped first (exit/kill) and relaunched in manual mode**, and dispatching resumes only after the mode is re-verified; "I changed a variable, so consider it downgraded" is not allowed;
-- Closing off the kimi-orch exception clause (the exception in the last item of Step 0, "the current session acts as orchestrator"): `--auto` means **Never Ask** — it does not interrupt the user, executes automatically and decides automatically; the user sitting at the terminal = attended, but **being present ≠ user approval**, and rename only registers an identity — it neither changes the CLI's permission mode nor makes the CLI wait for a person's nod before acting. If the current session is already running in `--auto` and cannot pass the three gates, only two choices are allowed: **(a) documented narrowing (not equivalent to manual approval)**: the user writes the authorization scope explicitly into `/tmp/$TAG/mode-selection.md` (which operations may be executed automatically, and how supervision and loss-cutting work); that branch executes as "**authorized automatic execution + human supervision**" and is labelled truthfully, no longer claiming to be equivalent to manual approval; **(b) without that record → stop work**. If you want actions to truly wait for a person's approval beforehand, you need a separate external dispatch/execution approval gate (this skill has no such built-in layer).
-
-Create a separate tab and launch three **brand-new clean** agents in the fixed layout (do not resume from old sessions). **Create each line's worktree in the main tree first, then create the panes and start the agents with the corresponding cwd** (a worktree isolates only working files and the index, not git metadata, and is not a security boundary — see "Known limitations"; when the project directory is **non-git**, fall back to launching with all three in the main tree, the isolation guarantee drops, **and unattended mode automatically falls back to attended mode** — see enablement gate 3 of "Unattended mode", and note it on the taskboard):
+Create a separate tab and launch N **brand-new clean** agents per the layout rules (do not resume from old sessions). **First create each slot's worktree in the main tree, then create panes and start agents with the corresponding cwd** (a worktree isolates only working files and the index, not git metadata, and is not a security boundary — see "Known limitations"; when the project directory is **not a git repo**, everything falls back to launching in the main tree with the same cwd, the isolation guarantee drops, **and unattended mode automatically falls back to attended mode** — see gate 3 of the "Unattended mode" enabling gates, and note it on the board):
 
 ```bash
-# 0) The two worktrees: one for the review line and one for the execution line (skip if they already exist); branch names carry the tag and never overlap.
-#    Execute strictly per the path plan fixed in the "first-run flow block": the non-git fallback (main-only) skips this, and all three cwds use the main tree
+# 0) One worktree per non-orch slot (skip if it already exists); branch names carry the tag and the slot name, so they never overlap.
+#    Execute only per the path plan fixed in the "first-run flow block": the non-git fallback (main-only) is skipped, and all N cwds use the main tree
 if [ "$PATH_PLAN" = worktree ]; then
-  git worktree add "$PWD/../wt-$TAG-review" -b "trio-$TAG-review"
-  git worktree add "$PWD/../wt-$TAG-exec"   -b "trio-$TAG-exec"
+  for s in $SLOTS; do
+    [ "$s" = orch ] && continue
+    git worktree add "$PWD/../wt-$TAG-$s" -b "trio-$TAG-$s"
+  done
 fi
 
-# 1) New tab: the kimi slot stays in the main tree; the root pane P0 is parsed from the returned JSON
+# 1) New tab: the orch slot stays in the main tree; root pane P0 parsed from the returned JSON
 P0=$(herdr tab create --workspace "$HERDR_WORKSPACE_ID" --cwd "$EXPECT_ORCH" --label <task name> --no-focus \
      | python3 -c 'import json,sys;print(json.load(sys.stdin)["result"]["root_pane"]["pane_id"])')
-# 2) Split P0 to the right → P1 (review slot); split P1 downward → P2 (execution slot) — cwd uses the expected values from the manifest (= the main tree in the non-git fallback)
-P1=$(herdr pane split "$P0" --direction right --cwd "$EXPECT_REVIEW" --no-focus \
-     | python3 -c 'import json,sys;print(json.load(sys.stdin)["result"]["pane"]["pane_id"])')
-P2=$(herdr pane split "$P1" --direction down --cwd "$EXPECT_EXEC" --no-focus \
-     | python3 -c 'import json,sys;print(json.load(sys.stdin)["result"]["pane"]["pane_id"])')
+# 2) Split-pane loop (P0 = the orch position): non-orch members in declaration order M1…M(N−1);
+#    M1: P0 --direction right → P1; Mk (k≥2): P(k−1) --direction down → Pk.
+#    At N=3 this matches the existing layout pane by pane; at N>3 the right column keeps extending downwards.
+#    Parse pane_id from the returned JSON at every split, never copy it by hand; also write $TD/panes.txt (`<slot> <pane_id>` one per line).
+PANE_OF_ORCH=$P0
+: > "$TD/panes.txt"; echo "orch $P0" >> "$TD/panes.txt"
+prev=$P0; first=1
+for s in $SLOTS; do
+  [ "$s" = orch ] && continue
+  if [ "$first" = 1 ]; then dir=right; first=0; else dir=down; fi
+  p=$(herdr pane split "$prev" --direction "$dir" --cwd "$(expect_of "$s")" --no-focus \
+      | python3 -c 'import json,sys;print(json.load(sys.stdin)["result"]["pane"]["pane_id"])')
+  eval "PANE_$(echo $s | tr a-z A-Z)=$p"
+  echo "$s $p" >> "$TD/panes.txt"
+  prev=$p
+done
 
-# 3) Start the agents: the parameters come from the arrays of "Mode selection"; hard-coding bypass/auto is a process violation
-herdr agent start "kimi-orch-$TAG"    --kind kimi   --pane "$P0" -- "${KIMI_ARGS[@]}"
-herdr agent start "codex-review-$TAG" --kind codex  --pane "$P1" -- -m gpt-6.1-sol -c model_reasoning_effort=high "${CODEX_ARGS[@]}"
-herdr agent start "claude-exec-$TAG"  --kind claude --pane "$P2" -- "${CLAUDE_ARGS[@]}"
-# Each array element becomes its own argv, so paths containing spaces are not split and an empty array produces no arguments; do not fall back to string concatenation (see the measurements under "Mode selection")
-# The model slug and the reasoning effort must be passed separately: the slug carries no effort, and the effort uses its own config key; `--settings` builds its path from the skill-directory variable and never hard-codes a user name (expanded on this machine = ~/.kimi-code/skills/trio-orchestrate), so it follows the install location after sharing
+# 3) Agent-start loop: look the slot up in "Backend profiles" and take parameters from the arrays chosen in "Mode selection";
+#    hard-coding bypass/auto is a process violation.
+#    `herdr agent start` needs --kind (kimi/codex/claude etc.); a member with no kind (genox) does not go through agent start,
+#    and is instead launched directly in its pane (see the genox entry under "Backend profiles": main path = generic pane launch
+#    + pane read status detection).
+for s in $SLOTS; do
+  eval "pane=\$PANE_$(echo $s | tr a-z A-Z)"
+  case "$s" in
+    orch) herdr agent start "$s-$TAG" --kind kimi --pane "$pane" -- "${KIMI_ARGS[@]}" ;;
+    *)    # non-orch slot: expand from that slot's cli and model/effort in the roster (the two lines below are the default-roster instance)
+          herdr agent start "$s-$TAG" --kind <that slot's cli> --pane "$pane" -- "${ARGS_OF_that slot[@]}" ;;
+  esac
+done
+# With the default roster this expands to exactly:
+#   herdr agent start "orch-$TAG" --kind kimi  --pane "$PANE_ORCH" --
+#   herdr agent start "rev-$TAG"  --kind codex --pane "$PANE_REV"  -- -m gpt-6.1-sol -c model_reasoning_effort=high "${CODEX_ARGS[@]}"
+#   herdr agent start "exec-$TAG" --kind claude --pane "$PANE_EXEC" -- "${CLAUDE_ARGS[@]}"
+# Array elements become separate argv items one by one; a path containing spaces is not split and an empty array produces no
+# argument. Do not fall back to string concatenation (see the measurement in "Mode selection")
+# The model slug and the reasoning level must be passed separately: the slug carries no level, and the level uses its own config
+# key; `--settings` builds its path from the skill-directory variable instead of a hard-coded username
 
-# 4) Rename all three panes (mandatory; skipping it leaves the agent name and the display label inconsistent); a pane label and an agent name are two objects
-herdr pane rename "$P0" kimi-orch-$TAG
-herdr pane rename "$P1" codex-review-$TAG
-herdr pane rename "$P2" claude-exec-$TAG
+# 4) Rename all N panes (mandatory; skipping it leaves the agent name and the display label inconsistent); the pane label and the agent name are two objects
+for s in $SLOTS; do
+  eval "pane=\$PANE_$(echo $s | tr a-z A-Z)"
+  herdr pane rename "$pane" "$s-$TAG"
+done
 
-# 5) bootstrap: the task directory / manifest / lock were already handled in the "detection" step → create the taskboard skeleton (only if missing; reentry does not overwrite) →
-#    take this launch's batch id (bootstrap ID) → wait for the ACK to be exactly equal to the expected text (cmp) — that is the criterion for "launch complete"
-TD="/tmp/$TAG"                             # the same task directory as in the "first-run flow block"; reset here so this block can be extracted and self-tested
+# 5) Bootstrap: the task directory/manifest/lock were already handled in the "detection" step → create the taskboard skeleton
+#    (only if missing; never overwrite on re-entry) → take this launch's bootstrap ID → wait for the ACK to be byte-identical to
+#    the expectation (cmp) — that is what "the launch is complete" means
+TD="/tmp/$TAG"                             # the same task directory as in the "first-run flow block"; re-set here so this block can be lifted out for self-testing
 mkdir -p "$TD"                             # idempotent
-SKILL_ABS=<absolute skill path known to the sender>   # e.g. /home/<user>/.kimi-code/skills/trio-orchestrate; always write absolute paths inside the package, and do not assume the other side will expand ${KIMI_SKILL_DIR}
-# ══ bootstrap ACK closed-loop block (start): extract it whole, set TD/TAG/SKILL_ABS, and it runs standalone (the other side's herdr may be replaced by a stub) ══
-# Seconds + a random tail only lowers the chance of collision; it does not promise concurrent uniqueness; concurrency exclusion relies on launch.lock — one TAG allows only one launch flow at a time
-BOOT_ID=$(date +%s)-$RANDOM                # this launch's batch id: old ACKs and leftovers from failures are told apart by it
+SKILL_ABS=<the skill's absolute path, known to the sender>   # e.g. /home/<user>/.kimi-code/skills/trio-orchestrate; always write absolute paths in the package, never assume the other side expands ${KIMI_SKILL_DIR}
+# ══ bootstrap ACK closed-loop block (begin): lift this whole block out, set TD/TAG/SKILL_ABS/SLOTS, and it runs standalone (a stub may stand in on the other side) ══
+# Seconds + a random tail only lowers the chance of a collision; it does not promise concurrent uniqueness. Concurrency
+# exclusivity is carried by launch.lock — one TAG allows only one launch flow at a time.
+BOOT_ID=$(date +%s)-$RANDOM                # this launch's batch id: it is how a stale ACK or a failed leftover is told apart
 [ -f "$TD/taskboard.md" ] || cat > "$TD/taskboard.md" <<'EOF'
 # taskboard
 
-## Backlog (with acceptance line + conflict surface)
-## In progress (claimant + time)
-## Pending review
-## Accepted (with evidence path)
+## 待办(带验收线+冲突面)
+## 在途(认领人+时刻)
+## 待审
+## 已验收(附证据路径)
 EOF
+# The line count varies with N: the ACK expectation = the bootstrap-id line + the tag line + N lines of <slot>-<tag> (fixed slot
+# order), with one trailing newline preserved
+NAMES=$(for s in $SLOTS; do echo "$s-$TAG"; done)      # N full names, fixed slot order
 rm -f "$TD/bootstrap-ack.md"               # clear the old ACK: only the receipt written by this run counts
-cat > "$TD/bootstrap.md" <<EOF
-bootstrap-id: $BOOT_ID
-skill file: $SKILL_ABS/SKILL.md (absolute path; activate the skill first and read this file, do not rely on the placeholder being expanded automatically)
-tag: $TAG
-taskboard: $TD/taskboard.md (the skeleton is already created)
-role names: kimi-orch-$TAG (orchestrate + accept) / codex-review-$TAG (review) / claude-exec-$TAG (execute, [机核] only)
-instruction: after reading the skill and the taskboard, write the ACK to $TD/bootstrap-ack.md. The ACK must be **byte-for-byte identical** to the five lines below (copy them verbatim, one item per line, no extra characters, no trailing spaces, keep exactly one final newline):
-bootstrap-id: $BOOT_ID
-tag: $TAG
-kimi-orch-$TAG
-codex-review-$TAG
-claude-exec-$TAG
-Do not run the launch flow again (do not create a new tab, do not start new agents).
-EOF
-# The full expected ACK text (byte-for-byte identical to the five lines given to the other side above), accepted by an exact-equality comparison:
-# An existence grep cannot stop "two contradictory values for the same field / duplicate lines / extra lines" (ruling 2026-10-09); the whole text must be compared
-cat > "$TD/ack-expected" <<EOF
-bootstrap-id: $BOOT_ID
-tag: $TAG
-kimi-orch-$TAG
-codex-review-$TAG
-claude-exec-$TAG
-EOF
-herdr agent prompt kimi-orch-$TAG "read $TD/bootstrap.md and carry out its instructions" --wait --timeout 120000
+{
+  echo "bootstrap-id: $BOOT_ID"
+  echo "技能文件:$SKILL_ABS/SKILL.md(绝对路径;先激活技能并读这个文件,不要依赖占位符自动展开)"
+  echo "tag: $TAG"
+  echo "看板:$TD/taskboard.md(骨架已建好)"
+  echo "成员全名:$(echo $NAMES | tr ' ' '/')(编排 + 审阅 + 执行等;限 [机核] 的条目见看板规则)"
+  echo "指令:读技能与看板后,把 ACK 写到 $TD/bootstrap-ack.md。ACK 必须与下面 $((N + 2)) 行**逐字节一致**(照抄、一行一项、不加别的字符、行尾不留空格、末尾保留一个换行):"
+  echo "bootstrap-id: $BOOT_ID"
+  echo "tag: $TAG"
+  for n in $NAMES; do echo "$n"; done
+  echo "不要再执行拉起流程(不要建新 tab、不要起新代理)。"
+} > "$TD/bootstrap.md"
+# The full expected ACK text (byte-identical to the $((N + 2)) lines handed to the other side above), compared in full on acceptance:
+# an existence grep cannot stop "two contradictory values of the same field / duplicate lines / extra lines" (2026-10-09 verdict),
+# so the whole text must be compared
+{
+  echo "bootstrap-id: $BOOT_ID"
+  echo "tag: $TAG"
+  for n in $NAMES; do echo "$n"; done
+} > "$TD/ack-expected"
+herdr agent prompt "orch-$TAG" "读 $TD/bootstrap.md 并按其指令执行" --wait --timeout 120000
 ack="$TD/bootstrap-ack.md"
-cmp -s "$TD/ack-expected" "$ack" || { echo "the ACK does not match the expected text (contradiction / duplicate / extra line / missing line): launch not complete"; exit 1; }
-rmdir "$TD/launch.lock"                    # ACK passes = launch complete, release the exclusive lock; if it stopped on a mid-way failure, finish the manual handling before deleting the lock and re-entering
+cmp -s "$TD/ack-expected" "$ack" || { echo "ACK differs from the expectation in full text (contradictory/duplicate/extra/missing lines): launch is not complete"; exit 1; }
+rmdir "$TD/launch.lock"                    # ACK passed = launch complete, release the exclusive lock; if it failed midway, handle by hand before deleting the lock and re-entering
 # ══ bootstrap ACK closed-loop block (end) ══
 ```
 
-The layout is always: kimi-orch on the left | codex-review top right | claude-exec bottom right (right first, then down; independent of width or height).
+The layout is always: the orch position on the left (main tree); non-orch members run down the right column in declaration order (N=3 means the reviewer top-right and the executor bottom-right, matching the existing layout pane by pane; right first, then down, independent of width). At N>5 the right column becomes hard to read, so splitting the task or adjusting panes by hand is advisable — **protocol identity anchors on the manifest, not on geometry**, and adjusting panes by hand does not affect the protocol.
 
-- The model name is whatever appears in codex's `/model` list; **the model slug and the reasoning effort must be passed separately**: `-m <slug> -c model_reasoning_effort=high`. Treating "GPT-6.1-Sol high" as a single model name gets rejected by the API with a 400 (under a ChatGPT account, high is a reasoning effort and not part of the model name — hit in a measurement on 2026-10-09: `-m` reported no error at the time, and it only blew up on the first request); the slug is whatever appears in the local `/model` list, and that model's default reasoning effort may not be high, so it must be set explicitly; if `-m` is rejected, start the default model and then pick the model + reasoning effort manually with `/model` in the pane, and note it on the taskboard — a manual workaround is acceptable, but it does not count as the normal "one-command / unattended" path;
-- **Status semantics are unified throughout the whole document** (the same set in Step 0, Step 3 and the restart checkpoint): **able to receive a new task = `idle` or `done`** (herdr's done is equally able to accept input); `working` is never used as a criterion, only as a supporting observation; `blocked` is a troubleshooting branch;
-- `agent start` only counts if it returns ready; if it will not start, first `herdr pane read` to see where it is stuck (codex often sticks on an upgrade prompt — press Esc to dismiss it); **when startup fails, first distinguish the two kinds**: a parameter validation failure where the process was never created → you may reuse that shell pane to fix the parameters and resend; the process already exists but is blocked/not-ready → troubleshoot first or wait for it to exit, do not blindly resend;
-- If the pane split succeeds but `agent start` fails (e.g. invalid_agent_name, in which case no process was created): the pane does not need to be recreated; fix the parameters and resend `agent start` on the same pane;
-- Acceptance: `herdr pane read "$P1" | tail` must show both the `<model> <reasoning effort>` segments in the status line, **and then send an insignificant test message to confirm no 400 pops up** before it truly counts as usable (looking at the displayed model name alone does not count); P2 must show bypass permissions on (unattended parameter set only) — **this only proves the permission mode, not that the deny list is mounted**. List acceptance has two levels: the file existing and the JSON being valid is a **syntax check** (verified in one line with `python3 -c "import json;json.load(open('...'))"`); the **effect check** is the orchestrator running `herdr pane read "$P2"` or having claude run `/status` (`/permissions`) and looking at the **settings sources and the list of effective rules**, pasting the effective rule entries into the taskboard as evidence — a syntax check ≠ an effect check, they are two different things. If no effective rules can be verified / the list is not in effect → **pause dispatching**: stop the already running claude first (exit/kill), relaunch it with the attended set (explicit `--permission-mode default`), and re-verify the mode and the rules after the relaunch; resume dispatching only once verified — merely changing a shell variable or writing one line on the taskboard cannot touch the old process and does not count as a downgrade;
-- The completion criterion of step 5 is **the ACK being exactly equal to the full text of `/tmp/$TAG/ack-expected` (`cmp -s`; content = the five lines: bootstrap ID, tag, and the three full role names)** — contradictory fields, duplicate fields and extra lines are all rejected; it is not some status observation, nor an existence grep: `agent get` serves only as a supporting observation — a short bootstrap is usually already idle/done by the time `--wait` returns, so working cannot be waited for (an older version treated working as a hard condition, judged wrong on 2026-10-09); once the ACK is complete, tell the user to switch to the new tab and hand the task to kimi-orch (it is the subsequent orchestrator; this launching session is only responsible for setting things up);
-- Exception (**precondition: mode selection has passed; or documented authorization has been made per "Mode selection" — the user has written the scope of authorized automatic execution into `/tmp/$TAG/mode-selection.md`**; `--auto` = Never Ask, presence ≠ user approval): if the user loaded this skill inside some kimi --auto session and wants that very session to act as the orchestrator, then do not create a new tab — **first register the agent identity with `herdr agent rename "$HERDR_PANE_ID" "kimi-orch-$TAG"`** (renaming a pane/tab is only a display label, a different object from the agent name; changing only the label does not register this session under the role name), then take the current pane as P0, split P1/P2 by the worktree/cwd rules above, start the two agents, rename all three panes as usual, **and also `herdr tab rename` the tab to the task name** (when that tab still mixes in other unrelated panes, instead append `<TAG>` after the original name). This exception does not exempt mode selection: if the three gates fail and there is no documented authorization as above, **disable the exception and stop work** (see "Mode selection"); rename only registers the agent identity, it does not change the CLI permission mode of this session and does not constitute user approval.
+- Model names follow each CLI's own `/model` list; **the model slug and the reasoning level must be passed separately** (e.g. codex `-m <slug> -c model_reasoning_effort=high`). Passing "GPT-6.1-Sol high" as a single model name is rejected by the API with a 400 (hit in practice 2026-10-09: `-m` did not complain at the time, and it only blew up on the first request); the slug follows this machine's `/model` list, and that model's default reasoning level may not be high, so it must be set explicitly; if `-m` is rejected, start the default model and pick the model + reasoning level manually with `/model` in the pane, and note it on the board — a manual rescue is fine, but it does not count as the normal "one-command / unattended" path;
+- **Status semantics are unified throughout the document** (Step 0, Step 3 and the restart checkpoint use one set): **able to receive a new ticket = `idle` or `done`** (herdr's done is equally input-ready); `working` is never a criterion, only a supporting observation; `blocked` is a troubleshooting branch. **Members without hooks (such as genox) do not have this set of status semantics**, and use "no active output in pane read + the previous ticket's ACK already on disk" as the receiving condition, see "Backend profiles";
+- Only a ready return from `agent start` counts; if it will not start, `herdr pane read` first to see where it is stuck (codex often sticks on an upgrade prompt — press Esc); **distinguish two kinds of launch failure**: parameter validation failure with no process created → fix the parameters and resend on the same shell pane; process alive but blocked/not-ready → troubleshoot first or wait for it to exit, never resend blindly;
+- If the pane split succeeded but `agent start` failed (e.g. invalid_agent_name, in which case no process was created): the pane need not be rebuilt; fix the parameters and resend `agent start` on the same pane;
+- Acceptance: `herdr pane read` each slot's pane; the review slot's status bar must show both `<model> <reasoning level>` segments, **then send one trivial test message to confirm no 400** before it counts as genuinely usable (looking at the displayed model name alone does not count); the execution slot must show bypass permissions on (unattended parameter set only) — **this only proves the permission mode, not that the deny list is mounted**. List acceptance has two layers: the file existing and valid JSON is a **syntax check** (`python3 -c "import json;json.load(open('...'))"` verifies it in one line); the **effect check** is the orchestrator using `herdr pane read` or having that agent run `/status` (`/permissions`) and looking at the **settings sources and the effective rule list**, pasting the effective rule entries onto the board as evidence — a syntax check is not an effect check, they are two different things. If no effective rules can be verified or the list has not taken effect → **pause dispatching**: stop the already-running execution slot (exit/kill) and relaunch it with the attended set (explicit `--permission-mode default`), then re-verify mode and rules after the relaunch, and only resume dispatching once verified — changing a shell variable or writing a note on the board cannot touch the old process and does not count as a downgrade;
+- The completion criterion for bootstrap is **the ACK being byte-identical to `/tmp/$TAG/ack-expected` (`cmp -s`; contents = bootstrap ID, tag and the N member full names, N+2 lines)** — contradictory fields, duplicate fields, extra lines, missing lines and trailing spaces are all rejected, and it is not some status observation nor an existence grep: `agent get` is only a supporting observation — a short bootstrap is usually already idle/done by the time `--wait` returns, and waiting for `working` never arrives (an older version made working a hard condition, judged wrong on 2026-10-09); once the ACK is complete, tell the user to switch to the new tab and hand the task to the orch-slot member (that member is the subsequent orchestrator; this launching session only does the setup);
+- Exception (**precondition: mode selection has passed; or a documented authorization was made per "Mode selection" — the user writing the authorized automatic-execution scope into `/tmp/$TAG/mode-selection.md`**; `--auto` = Never Ask, being present ≠ the user approving): if the user loaded this skill inside some kimi --auto session and wants that session itself to be the orchestrator, then do not create a new tab — **first register the agent identity with `herdr agent rename "$HERDR_PANE_ID" "orch-$TAG"`** (renaming a pane/tab is only a display label and is a different object from the agent name; changing the label alone does not register this session under a role name), then take the current pane as P0, split the remaining slots per the worktree/cwd rules above, start the remaining agents, and rename all panes as usual, **and also `herdr tab rename` the tab to the task name** (when that tab also holds unrelated panes, append `<TAG>` to the original name instead). This exception does not exempt mode selection: if the three gates fail and there is no documented authorization above, **disable the exception and stop work** (see "Mode selection"); rename only registers agent identity, does not change this session's CLI permission mode, and does not constitute user approval.
 
-## Substitute team assembly (when the three-piece set is incomplete)
+## Team assembly and substitutes (when the declared team is incomplete)
 
-- **kimi-orch cannot be substituted**: the skill runs inside kimi, but the binary check must still be performed (being able to run in the current session ≠ a kimi that can start a new instance is on PATH); only a missing review/execution agent leads to this section;
-- **Availability has two levels of checking, both required**: ① `command -v <cli>` — the binary exists (a CLI on PATH that can start a new instance; being runnable in the current session does not count); ② `herdr integration status` shows `current` (the status hook is installed). If ② is missing you can install it with `herdr integration install <agent>`; if it cannot be installed, downgrade to a spare — it can start and run, but idle/working detection is unreliable, the `agent get` observation of communication protocol step 3 becomes ineffective, and only manual `pane read` watching is left;
-- **Candidates must be recorded**: for each candidate, write down the CLI kind + provider/model + the role's capabilities and permission boundary; "different backend" is judged by those two items, not by the binary name alone; substitute order (general priority; on each machine the two-level check decides, the annotations below are examples only):
+- **The orch slot is irreplaceable**: the skill runs inside kimi, but the binary check still has to run (being able to run in the current session ≠ there being a kimi on PATH that can start a new instance); substitute only when the missing capability is review/execution or similar;
+- **Two-level availability check, both required**: ① `command -v <cli>` — the binary exists (a CLI on PATH that can start a new instance; being runnable in the current session does not count); ② `herdr integration status` shows `current` (the status hook is installed). A missing ② can be fixed with `herdr integration install <agent>`; if it cannot be fixed, downgrade to a spare tyre — it can start and run, but idle/working detection is unreliable, Step 3's `agent get` observation stops working, and only `pane read` by hand remains (**backends with no kind that herdr does not recognize, such as genox, are in this class — see "Backend profiles"**);
+- **Candidates must be recorded**: each candidate states the CLI kind + provider/model + that slot's capability and permission boundary; "different backend" is judged on these two items and cannot be read off the binary name alone; the candidate pool is queried **by capability** (not by fixed role):
 
-| Role | First choice | Substitute order |
+| Capability | First choice | Substitute order (examples; trust the two-level check as measured) |
 |---|---|---|
-| Review | codex | copilot → opencode (install the hook first) → a second kimi |
-| Execute | claude | codex → copilot → opencode (install the hook first) |
+| orch | kimi | none (irreplaceable) |
+| rev | codex | copilot → opencode (install the hook first) → a second kimi |
+| exec | claude | codex → copilot → opencode (install the hook first) → genox (attended set only) |
 
-- **Hard constraint: review and execution must not share a backend** — same-origin blind spots mean reviewing equals not reviewing. "Different backend" here = **different CLI and different model family** (the same CLI with another model, or different CLIs connected to the same provider/model, both count as same-origin);
-- **Cast roles by enumeration, not by greediness**: list the review candidates × execution candidates as pairs and take the **first legal pair satisfying "different CLI and different model family"** (the two roles also cannot be the same live agent). Counter-example: when only codex and kimi are available, the legal solution is **kimi reviews + codex executes**; a greedy rule of "review keeps its first choice, only the execution rank slides down" would wrongly report no solution;
-- Candidate health checks are at the same level as for the main backend (binary + integration `current` + account/model availability); if enumeration still yields no legal pair, **report clearly that no team can be assembled and stop — do not force one**;
-- Role names do not change: `codex-review-<tag>` / `claude-exec-<tag>` are **slot names, not backend names** (the protocol, the taskboard and communication all stay the same), and the actual backend and kind are written into the taskboard header; `--kind` takes the actual backend (the list herdr supports is whatever `herdr agent start --help` shows);
-- Substitute CLIs differ in their no-confirmation parameters (codex `--approve-for-me`, claude `--dangerously-skip-permissions`, others per that CLI's actual `--help`); after launching, use `herdr pane read` to check the permission mode and accept the model/reasoning effort actually in effect, recording them on the taskboard;
-- When claude is absent, the `--settings` mount of `claude-exec-deny.json` automatically becomes void — a substitute backend has no equivalent mechanism, so **that line's unattended capability is disabled along with it** (switch to attended, or set up a process-level sandbox separately); you cannot just note the disarmament and keep following unattended discipline.
+- **Hard constraint: rev-capability members and exec-capability members must not be same-origin** — a same-origin blind spot means a review by one of the other is no review at all. Same-origin judgement is in the pairwise constraint under "Slots and roster declaration" (different CLI and different model family);
+- **Assemble by enumeration, not greedily**: give the candidate pool for each slot to be filled, enumerate **all combinations**, and take the first complete assignment satisfying [capability coverage + pairwise constraint + two-level health check + not the same live agent]. Keep the existing counter-example lesson: "fixed first choice + greedy fallback down the list" stays banned — with only codex and kimi available, the legal solution is **kimi reviews + codex executes**; a greedy rule of "review has a fixed first choice, only step the execution choice down the list" would wrongly report no solution;
+- Candidate health checks are at the same level as for a primary backend (binary + integration `current` + account/model availability); if enumeration still yields no legal team, **report clearly that the team cannot be assembled and stop; do not force one**;
+- **Role names are unchanged, and they are slot names, not backend names**: `rev-<tag>`/`exec-<tag>` are slot names (protocol, taskboard and communication all unchanged), while the actual backend and kind are written into the board header; `--kind` takes the actual backend (the list herdr supports follows `herdr agent start --help`);
+- Substitute CLIs have different no-confirmation parameters, so verify the mode after launch: generalized to **verify per CLI against its backend profile** (see "Backend profiles": one entry per CLI with the two-level health check, parameter sets, deny-mount capability and whether a status hook exists);
+- **Deny-list mounting differs by CLI**: only the claude family has an equivalent mechanism for mounting a deny list via `--settings`; **when a non-claude execution slot has no equivalent mechanism, that slot's unattended capability is disabled along with it** — that slot switches to the attended parameter set, or gets a process-level sandbox of its own; **"just note on the board that the guard was dropped" and keep running as unattended is not allowed**.
 
-## Step 1: Set up the taskboard
+## Step 1: put up the taskboard
 
-`/tmp/<TAG>/taskboard.md` (TAG being the task tag fixed in Step 0), four columns: Backlog (with acceptance line + conflict surface) / In progress (claimant + time) / Pending review / Accepted (with evidence path). Write the rules into the taskboard header:
+`/tmp/<TAG>/taskboard.md` (TAG being the task tag fixed in Step 0), four columns: to-do (with acceptance line + conflict surface) / in flight (claimant + time) / awaiting review / accepted (with evidence paths). The rules go into the board header:
 
-1. **Single writer: taskboard.md is written only by the orchestrator (kimi-orch)**; working agents do not edit the taskboard directly, they only write their results to their own result file under `/tmp/<TAG>/` (e.g. `<task-id>-result.md`), and the orchestrator moves columns by pointer — several parties writing the same Markdown overwrite each other;
-2. Claiming writes your name, moving a column carries evidence (test counts / hashes / file paths); words alone are not proof;
-3. **Evidence is bound to a code version**: every task carries a task ID and a **base commit**; the receipt must carry the **tested commit** + artefact path + checksum; review and merge check the same revision — once the code changes again (dirty worktree, moved HEAD), the old acceptance is void and must be re-run and re-signed;
-4. claude-exec only claims entries marked **[机核]** (acceptance line machine-checkable: test counts / hashes / gate scripts); its written report is not evidence;
-5. codex-review pulls the "Pending review" column and writes the verdict to disk under /tmp and sends a pointer;
-6. **Commit discipline (unified across all roles)**: each line has its own index; `git add` only by task path, never `git add -A`; check `git diff --cached` before committing to confirm it contains only this task's changes, and never make a bare commit without looking at the staged content; line prefixes match the actual role: `[kimi-orch]`, `[codex-review]`, `[claude-exec]`; renames/moves must be completed atomically together with the commit;
-7. The full suite takes the slot serially; multi-line work uses `git worktree` double buffering;
-8. Pre-registered numbers (write the expectation down before running) take precedence over after-the-fact explanation.
+1. **Single writer: taskboard.md is written only by the orchestrator (the orch-slot member)**; working agents do not edit the board directly, they only write results into their own result file under `/tmp/<TAG>/` (e.g. `<task-id>-result.md`), and the orchestrator moves the column by pointer — several parties writing the same Markdown file overwrite each other;
+2. Claiming writes your name, moving a column attaches evidence (test counts/hashes/file paths); words alone are not evidence;
+3. **Evidence is bound to a code revision**: every ticket carries a task ID and a **base commit**; a receipt must carry the **tested commit** + artifact paths + checksums; review and merge check the same revision — if the code changes again (dirty worktree, HEAD moved) the old acceptance lapses and must be re-run and re-signed;
+4. exec-capability members claim only tickets marked **[机核]** (machine-checkable acceptance line: test counts/hashes/gate scripts); their prose reports are not evidence;
+5. rev-capability members pull from the "awaiting review" column and land their verdicts in /tmp with a pointer;
+6. **Commit discipline (uniform across members)**: each line has its own index; `git add` only by task path, never `git add -A`; check `git diff --cached` before committing to confirm it contains only this task's changes, and never make a bare commit without looking at what is staged; the line prefix matches the actual slot: `[<slot>-<tag>]` (e.g. `[orch-g07]`, `[rev-g07]`, `[exec-g07]`); renames/moves must be completed atomically with the commit;
+7. A full test suite is serialized on one slot; use `git worktree` double-buffering for multi-line construction;
+8. A pre-registered number (write the expectation down before running) beats a post-hoc explanation;
+9. **The composite slot `revtest` and the invalidity of self-review (taskboard routing)**: for a ticket the revtest member produced itself, **the review-signature column stays empty**, and the orch moves it straight to "accepted" after its own final verdict, annotating that line "**self-review invalid, orch final verdict**" — the single-writer rule is unchanged and the right to move columns stays with the orch alone.
+
+**The "launch information" section in the board header (the roster table)**: besides the 8 rules above, the board header carries a roster table recording, per slot: slot / agent full name / backend CLI / provider+model / reasoning level / worktree path / parameter set (unattended or attended) — this is the single quick-reference table for re-entry, troubleshooting and "who is doing what".
 
 ## Unattended mode (pre-authorization for fully automatic collaboration)
 
-When the user is not present and nobody clicks confirm, modifications/deletions/git operations are **pre-authorized and released**. First distinguish three layers: the **permission mode** (bypass) only saves confirmations, and **isolation** (a worktree per line) only separates working files and the index; neither is **a security boundary** (see "Known limitations"); the real hard boundary is a process-level sandbox/container + restricted credentials + remote branch protection.
+When the user is absent and nobody clicks to confirm, modifications/deletions/git operations are **pre-authorized**. Separate three layers first: the **permission mode** (bypass) only saves confirmations, and **isolation** (a per-slot worktree) only separates working files and the index; neither is a **security boundary** (see "Known limitations"); the real hard boundaries are a process-level sandbox/container + restricted credentials + remote branch protection.
 
-**Enablement gates (conditionally on, not on by default) — if any of the three is not satisfied, fall back to attended mode and do not start work with default permissiveness:**
+**Enabling gates (conditionally on, not on by default) — if any of the three is unmet, fall back to attended mode; do not start with the default permissive flags:**
 
-| # | Must be satisfied before enabling | Behaviour when not satisfied |
+| # | Must hold before enabling | Behaviour when it does not |
 |---|---|---|
-| 1 | Push hard boundary: the remote main/master has **branch protection** set (or pushes use only permission-restricted credentials) | The execution line is **banned from pushing**; changes stay on a local branch and the orchestrator pushes them manually |
-| 2 | Credential surface: the runtime environment does not mount non-essential credentials (or isolation via a separate Unix user / container) | Unattended mode is not enabled |
-| 3 | The directory is a git repository and a worktree can be created (a non-git directory has no usable isolation line) | **A non-git directory automatically falls back to attended mode** — this is a downgrade path, not an equivalent substitute |
+| 1 | Push hard boundary: remote main/master has **branch protection** set (or pushes use only restricted credentials) | **Ban pushes** for every exec-capability member; changes stay on local branches and the orchestrator pushes by hand |
+| 2 | Credential surface: the runtime mounts no unnecessary credentials (or isolation via a separate Unix user/container) | Do not enable unattended mode |
+| 3 | The directory is a git repo and worktrees can be created (a non-git directory has no usable isolation line) | **A non-git directory automatically falls back to attended mode** — this is a degraded path, not an equivalent substitute |
 
-All three are **checks to perform before starting work**, not explanations afterwards; if not verified, treat them as unsatisfied. How to write the item-by-item evidence for the three, and how "all three gates pass → unattended parameter set / any fails → attended parameter set" lands, is in the "**Mode selection**" part of Step 0 — the startup parameters are chosen there, and default permissiveness is not granted here. The attended set you fall back to **must give claude an explicit `--permission-mode default` and verify the real mode**: not passing bypass ≠ manual approval (≥2.1.283 may inherit auto or the user's default mode), and changing variables in an existing session has no effect — it must be stopped and relaunched.
+All three are **pre-work checks**, not after-the-fact explanations; if unverified, treat them as unmet. The per-item evidence and the landing of "all three gates pass → unattended parameter set / any failure → attended parameter set" are in Step 0's "**Mode selection**" — the launch parameters are chosen there and are not defaulted to permissive here. The attended set a failure falls back to **must be given explicitly per CLI profile** and its real mode verified: omitting bypass ≠ human approval, changing a variable in an existing session does not take effect either, and you must stop and relaunch.
 
-1. **One git worktree per line** (a precondition only once enablement gate 3 is satisfied; the orchestrator creates them in Step 0 before starting the agents): each line has its own branch and its own index, so `commit -a` / `stash` / `reset` are limited to that line's working files — but see "Known limitations" item 3, git metadata is not isolated;
-2. Only kimi-orch merges/writes to the main tree; claude-exec/codex-review do not touch the main tree — this is a **disciplinary convention**, and mechanically it cannot be stopped (the execution line was measured to be able to change main-tree refs), so it relies on pre-commit checks and acceptance as a backstop;
-3. Freedom to delete and modify is limited to your own worktree and the `/tmp/<TAG>/` task directory; deleting or modifying anything beyond that still requires the user's confirmation — this is the **default authorization scope**; if, per gate 3 of "Mode selection", the user explicitly chose "same-user cross-directory access", then record it here as "the authorization scope the user has chosen" and stop simultaneously claiming that crossing directories always requires confirmation;
-4. Pushing is allowed only to each line's branch and is reported along with the taskboard; pushing to main/master and force-pushing are permanently banned — but **the deny list is only a textual prefix soft defense line and can be bypassed by equivalent formulations** (measured forms in "Known limitations" item 1); for a true permanent ban, set branch protection on the remote / use permission-restricted credentials;
-5. The deny list keeps only permanent bans (sudo / disk destruction / force-push / push to main / reading secrets) — unattended, a long list only deadlocks batch runs; the real backstop is machine-checkable acceptance + worktree isolation + commit discipline (their boundaries are in "Known limitations").
+**Deny-list mounting differs by CLI**: only the claude family has an equivalent mechanism for mounting a deny list via `--settings`; **when a non-claude execution slot has no equivalent mechanism, that slot's unattended capability is disabled unconditionally** (switch to the attended parameter set, or configure a process-level sandbox), and "just note on the board that the guard was dropped" and keep running as unattended is not allowed.
+
+1. **One git worktree per non-orch slot** (a precondition only once gate 3 holds; created by the orchestrator in Step 0 before the agents start): each slot gets its own branch and index, so `commit -a`/`stash`/`reset` act only within that slot's working files — but see "Known limitations" item 3: git metadata is not separated;
+2. Only orch-slot members merge/land into the main tree; other slots leave the main tree alone — this is a **disciplinary agreement** and cannot be enforced mechanically (the execution line has been measured modifying main-tree refs); the backstop is checking before committing plus acceptance;
+3. Freedom to delete and modify is limited to your own worktree and under the `/tmp/<TAG>/` task directory; deleting or modifying anything outside still requires the user's confirmation while present — this is the **default authorized scope**; if the user explicitly chose "same-user cross-directory access" under gate 3 of "Mode selection", record it here as "the scope the user has chosen" and stop claiming simultaneously that cross-directory always confirms;
+4. Push only your own slot branch and report it on the board; pushing to main/master and force-pushing are forever banned — but the **deny list is only a textual-prefix soft defence and can be bypassed by equivalent spellings** (measured forms are in "Known limitations" item 1); to make the ban real, set remote branch protection / use restricted credentials;
+5. The deny list keeps only permanent bans (sudo/disk destruction/force-push/pushing main/reading secrets) — under unattended operation a long list only jams the batch; the real backstop is machine-checkable acceptance + worktree isolation + commit discipline (their boundaries are in "Known limitations").
 
 ## Known limitations (promises downgraded, stated honestly)
 
-1. **The permanent push ban is not a hard block**: the `Bash(git push ...)` entries in `claude-exec-deny.json` are only **textual prefix rules**, a soft defense line that equivalent formulations can bypass; the bypass forms are distinguished by method (not lumped together as "all measured") — `git push origin HEAD:main` (the main of a local bare remote was actually rewritten) and `git push origin --force` are **real Git executions**, evidence `/tmp/skill-review/evidence.json`; `git push upstream main`, `+refspec` force-push, the `git -C <dir> push ...` wrapper, and argument-less `git push` (which reads the upstream/refspec configuration) are only **prefix-rule text modelling** (the command string compared against the rule list, with no real Git execution record); none of the above forms **were measured inside the Claude permission engine**. `--force`, `-f` and `--force-with-lease` are three independent prefixes, so the list is incomplete. A true permanent ban can only come from **remote branch protection / restricted credentials / a controlled push entry point**, acting on the parsed target ref and force semantics;
-2. **Reading secrets only covers direct reads within cwd**: the `Read(./**/...)` rules do not reach `~/.ssh/` or CLI credential directories, nor do they stop **indirect reads**: a subprocess (Python/Node) opening files itself, or a search that does not explicitly list file names. Dangerous forms enter the deny list by **enumeration** (`.env.local` / `.env.production` / `.env.development` / `.env.staging`, `credentials.json`, `*.key`, `id_rsa`, etc.), so template names (`.env.example` / `.env.sample` / `.env.template`) are naturally never matched — permissions are evaluated deny → ask → allow, **a broad deny overrides a narrow allow, so do not count on a whitelist exemption**; enumeration is inherently incomplete, and an unattended environment **should not mount non-essential credentials**; the read boundary must be enforced by process-level file permissions/a sandbox, and no configuration may claim to have enumerated "all secrets";
-3. **A worktree is not a security boundary**: it isolates only working files and the index, while **git metadata (config/refs under the common dir) is shared with the main tree** — it was measured that the execution line's `git config` is read by the main tree, that `git update-ref refs/heads/main` can change the main tree's main ref, and that it can push to a local remote's main. So "only the orchestrator can touch the main tree" is a **disciplinary convention that does not hold mechanically**; for a hard boundary you need a process-level sandbox/container + a separate Unix user + restricted remote credentials, enabled after the user has explicitly chosen the authorization scope;
-4. **Substitute backends have no equivalent control**: when claude is absent the `--settings` mount becomes void, and a substitute CLI has no equivalent deny mechanism; that line's unattended capability should then be disabled or switched to attended (see the last item of "Substitute team assembly");
-5. **`/tmp` may be cleaned by the system**: the taskboard, ACKs and verdicts all live in `/tmp/<TAG>/`, and a reboot or a cleanup service will delete them; the key manifest, the final verdict and recovery pointers must be stored separately in a persistent location inside the project (see item 1 of "Context/token discipline");
-6. **The heartbeat cron belongs to the session**: a scheduled task belongs to the current session and is not inherited by a new session, so it must be recreated (see the last item of Step 3).
+1. **The push ban is not a hard block**: `Bash(git push ...)` in `claude-exec-deny.json` is only a **textual prefix rule**, a soft defence that equivalent spellings can bypass; the bypass forms are distinguished by method (not lumped together as "measured") — `git push origin HEAD:main` (the local bare remote's main is actually rewritten) and `git push origin --force` are **real Git executions**, evidence `/tmp/skill-review/evidence.json`; `git push upstream main`, `+refspec` force-pushes, the `git -C <dir> push ...` wrapper and bare `git push` (which depends on upstream/refspec config) are only **text modelling of the prefix rule** (the command string compared against the rule list, with no real Git execution recorded); none of these forms is **measured inside the Claude permission engine**. `--force`, `-f` and `--force-with-lease` are three independent prefixes, and the list is incomplete. A genuine permanent ban can only come from **remote branch protection / restricted credentials / a controlled push entry point**, enforced on the parsed target ref and force semantics;
+2. **Secret reading is covered only for direct reads inside cwd**: the `Read(./**/...)` rules cannot reach `~/.ssh/` or CLI credential directories, and cannot stop **indirect reads**: a subprocess (Python/Node) opening a file itself, or a search that names no file explicitly. Dangerous forms go into deny by **enumeration** (`.env.local`/`.env.production`/`.env.development`/`.env.staging`, `credentials.json`, `*.key`, `id_rsa`, etc.), which is why template names (`.env.example`/`.env.sample`/`.env.template`) are naturally not matched — permissions are evaluated deny → ask → allow, and **a broad deny beats a narrow allow, so do not count on a whitelist exemption**; enumeration is inherently incomplete, so an unattended environment **should not mount unnecessary credentials**; the read boundary must be enforced by process-level file permissions/a sandbox, and no configuration can claim to have enumerated "all secrets";
+3. **A worktree is not a security boundary**: it isolates only working files and the index, while **git metadata (config/refs under the common dir) is shared with the main tree** — measured: the execution line reading `git config` sees the main tree's, `git update-ref refs/heads/main` can change the main tree's main ref, and it can push the local remote's main. So "only the orchestrator may touch the main tree" is a **disciplinary agreement that does not hold mechanically**; a hard boundary requires a process-level sandbox/container + a separate Unix user + restricted remote credentials, enabled after the user explicitly chooses that authorized scope;
+4. **Substitute backends have no equivalent controls**: when claude is absent, `--settings` mounting is unavailable and substitute CLIs have no equivalent deny mechanism; that slot's unattended capability should then be disabled or switched to attended (see the last item of "Team assembly and substitutes");
+5. **`/tmp` may be cleaned by the system**: the taskboard, ACKs and verdicts all live in `/tmp/<TAG>/`, and a reboot or a cleanup service will delete them; the key manifest, the final verdict and the recovery pointer must be saved elsewhere in a durable location inside the project (see item 1 of "Context/token discipline");
+6. **A heartbeat cron belongs to its session**: scheduled tasks belong to the current session and are not inherited by a new session, so they must be recreated (see the last item of Step 3);
+7. **Members without hooks have no status semantics**: neither herdr's agent kind list nor this machine's integration list contains genox (23 kinds / 17 integrations, triple-confirmed, evidence `/tmp/genox/T001-b-evidence/60-herdr-agent.stderr`, `/tmp/genox/T001-b-evidence/63-herdr-integration-install-help.stdout`, `/tmp/genox/T001-b-evidence/62-herdr-integration-status.stdout`), and `herdr agent read` on a genox pane reports `agent_not_found` outright (evidence `/tmp/genox/T001-b-evidence/87-agent-read.stdout`); only `herdr pane read` can read the screen (measured to work, evidence `/tmp/genox/T001-b-evidence/85-pane-read-visible.stdout`). A genox slot's idle/working is therefore a **screen inference**, weaker than a hook; the protocol's closed loop does not depend on it (it anchors on the on-disk ACK), but **dispatching timeliness is degraded**: glance at `pane read` before dispatching and before collecting the ACK, and let the on-disk ACK decide everything. `herdr pane wait-output --match/--regex --timeout` is a ready-made blocking primitive (measured `output_matched`, evidence `/tmp/genox/T001-b-evidence/89-wait-output.stdout`) that can be used to wait for the moment "it is time to move on".
 
-Until the hard boundaries corresponding to items 1–3 above (remote protection, credential isolation, worktree availability) have been accepted, handle them per the **enablement gates** of "Unattended mode": fall back to attended mode, and do not grant permissiveness by default.
+Until the hard boundaries behind items 1–3 above (remote protection, credential isolation, worktree availability) are accepted, handle it per the **enabling gates** of "Unattended mode": fall back to attended mode, and do not default to permissive.
 
-## Step 2: Dispatch work by layer (by judgement density, not by pane)
+## Backend profiles
+
+> One entry per backend CLI: **kind name / two-level health check / parameter sets (unattended, attended) / deny-mount capability / whether a status hook exists / entry-specific notes**. Step 0's "agent-start loop" looks parameters up here by the slot's cli; Step 0's "Mode selection" takes explicit parameters per CLI from the two-row table here. **CLI-specific experience with a raw CLI (such as network egress) is recorded here, while Step 3 keeps only general rules.**
+
+**Parameter-set table (two rows — unattended / attended — × one column per profiled CLI)**:
+
+| CLI | Unattended set (all three gates pass) | Attended set (any failure) | Deny mount | Status hook |
+|---|---|---|---|---|
+| kimi | `--auto` | no `--auto` (its semantics is Never Ask) | none | yes (see kimi in `integration status`) |
+| codex | `--approve-for-me` | **explicit** `-a on-request -c approvals_reviewer=user` (inheritance is not accepted: omitting the flag ≠ human approval — this machine's user config is measured as `approval_policy = "never"`; the approver is separately determined by `approvals_reviewer`, so **on-request does not mean every command asks a human**) | none | yes |
+| claude | `--dangerously-skip-permissions --settings ${KIMI_SKILL_DIR}/claude-exec-deny.json` | **explicit** `--permission-mode default` + `--settings` (deny only tightens, never loosens); from ≥2.1.283, not passing bypass may still inherit auto or the user's `permissions.defaultMode`, so **inheritance is not accepted**; verify the real mode after launch | **yes** (claude family only) | yes |
+| ↑ note | when the roster contains **several claude-family slots** (e.g. `exec=claude` + `exec2=claude`), **every instance mounts the same `--settings` deny list**: the list is **mounted per instance**, not "bound to one particular slot" — the existing conclusion that it "binds only the `exec` slot and does not affect a user's own separately launched claude" is precisely the proof of per-instance mounting; when adding a claude-family slot, the launch loop still carries `--settings`, and none is left out | | | |
+| copilot / opencode / others | follow that CLI's `--help` as measured (**verify per CLI**, do not copy the values above) | same as left, explicit manual mode | none | present after `herdr integration install <agent>` |
+| **genox** | **none** (see below) | interactive `genox chat` (the attended set is its only usable set) | **none** | **none** (herdr has no genox kind/integration) |
+
+**Two-level health check (uniform across backends)**: ① `command -v <cli>` — the binary exists; ② `herdr integration status` shows `current`. **For a backend with no kind (genox), ② is necessarily missing**, so treat it as a spare tyre: `agent get` observation stops working and only `pane read` remains.
+
+### The genox entry
+
+**[Real execution] facts (all evidence under `/tmp/genox/T001-b-evidence/`, Genox 3.0.1)**:
+
+- **Interactive command and flags**: `genox chat`, flags only `--base-dir/-d`, `--verbose/-v`, `--help`; **chat has no no-confirmation parameter** (evidence `10-help-chat.stdout`);
+- **The no-confirmation flags are on `genox run`**: `--approve-generated-plan` (generate a plan and approve it directly, without asking anyone) and `--plan FILE --approve-plan` (approve a given plan file); the source `run_preflight.py:292-318` makes clear it is `interactively_reviewed=False` and, with no TTY and no approval, reports "No TTY is available and the master plan is unconfirmed. Use --plan FILE --approve-plan or --approve-generated-plan." (evidence `72-approval-source-scan.txt`, `73-interactive-detection.txt`). **End-to-end unattended completion = [not tested]**: this machine has no external network, a TCP connect to `api.openai.com:443` immediately gives `Network is unreachable` (evidence `50-network-probe.txt`), and both paths die at the model call (evidence `41-run-approve-generated-plan.stdout`, `53-run-plan-file2.stdout`);
+- **No-TTY behaviour**: `genox chat` with no TTY and `</dev/null` prints the banner and the `>` prompt, reads EOF and prints `Goodbye!`, **exit code 0, no hang** (evidence `30-chat-null-stdin.stdout`/`.exit`); in a pty it was measured reaching the interactive prompt and exiting cleanly on `/quit` (evidence `32-chat-pty.raw`); exit-code convention **0 normal / 2 usage error / 1 business rejection** (evidence `06-genox-badflag.exit`);
+- **Process hygiene**: add **`--foreground`** to `genox run` to stop the coordinator from detaching (without it, it leaves the terminal); a failure may leave stale `.control.lock` metadata (measured: a lock file left by a dead pid, which **does not block subsequent starts** — three consecutive runs without unlock all started normally), and the cleaner is `genox unlock [slug] [--control]` (evidence `48-workspace-state.txt`, `49-lockpid-check.txt`, `10-help-unlock.stdout`);
+- **Doctor posture**: `permission mode: workspace-write`, `allow_network: True`, `confirm_destructive: True`, bubblewrap available (mode auto), 76 built-in tools, mcp disabled; configuration follows **defaults + environment variables**, `~/.genox/` is cache only with no settings/permission config file (evidence `21-genox-doctor.stdout`, `20-genox-version.stdout`, `70-config-surface.txt`).
+
+**Slot limits (insurance clauses while there is no status hook)**:
+
+1. **It must not take the orch slot** (the exactly-one-orchestrator hard constraint): the orch collects ACKs, runs the three gates and dispatches, all relying on reliable status semantics, which genox does not meet;
+2. **It may take rev / rev2 / exec / exec2…exec9 / revtest**, but:
+   - its only parameter set is **attended** — **`genox run --approve-generated-plan` is recorded as a headless batch path [end-to-end not tested]**; backfill this profile once a usable path is measured;
+   - **dispatching**: `herdr agent prompt --wait` is unavailable (no registered agent), so send a **short pointer** over the pane channel instead (the existing "panes carry only short pointers" rule already holds), and long text still lands on disk;
+   - **status detection is degraded**: the orchestrator infers idle/working from the screen with `pane read`, **glancing once before dispatching and once before collecting the ACK**; `working` is never a criterion, and the on-disk ACK decides everything;
+   - the "idle or done" part of the receiving condition lands, for a genox slot, as "**no active output in pane read + the previous ticket's ACK already on disk**", with no vagueness allowed;
+3. **The heartbeat cron is hung for a genox slot as usual**, and deleted once the loop closes;
+4. **Process hygiene**: genox runs in the foreground in a pane shell, so the restart sequence = exit inside the pane → **confirm with `pane read` that the shell prompt is back** → resend the command (the existing restart sequence's `herdr agent list` verification step does not apply to genox; confirm via pane read that the process is gone instead).
+
+**Upgrade path (option b)**: write a genox integration hook for herdr (it requires understanding herdr's plugin mechanism and tracking upstream versions); once it lands upstream, this entry upgrades in place to the "has a hook" class, and the roster/naming/taskboard all stay unchanged. **Rejected option (c)**: mapping `agent start --kind` to the nearest kind — the kind determines herdr's driver protocol (prompt injection/status parsing), so a wrong kind breaks both send and receive, and it is a pseudo-registration that pollutes the registry.
+
+## Step 2: layered dispatch (by judgement density, not by pane)
 
 | Layer | Content | Dispatched to |
 |---|---|---|
-| A Judgement-dense (debugging / design / tradeoffs) | kimi subagents (Agent tool, may run several in parallel) |
-| B Implementation whose spec is already frozen | kimi subagents, or claude-exec + a strict spec |
-| C Mechanical execution (run the suite / regenerate / read large files / reconcile tables) | claude-exec |
-| Review | codex-review |
+| A, judgement-dense (debugging/design/trade-offs) | the orchestrator's subagents (Agent tool, several in parallel) |
+| B, implementation with a settled spec | the orchestrator's subagents, or exec-capability members + a strict spec |
+| C, mechanical execution (running suites/regenerating/reading large files/table lookups) | exec-capability members |
+| Review | rev-capability members |
 
-**The criterion for dispatch grading (fixed 2026-10-09)**: if the task book still contains "how should this be designed" decisions (which implementation to choose, how to split it, what threshold to set) = **layer A**, left to kimi subagents — **it must not be marked [机核] and dispatched to claude-exec**; [机核] marks only layer-C work whose method is already frozen and whose acceptance line is machine-checkable (commands, paths and expected values all present, requiring no judgement from the executor). Handing design work down as [机核] equals making the executor take your design decisions for you, and no machine-checkable receipt can make up for that.
+**The criterion for dispatch tiering (fixed 2026-10-09)**: if the task brief still contains "how should this be designed" decisions (which implementation, how to split it, what threshold) = **layer A**, kept for the orchestrator's subagents — **it must not be marked [机核] and dispatched to exec-capability members**; [机核] marks only layer-C work whose method is already fixed and whose acceptance line is machine-checkable (commands, paths and expected values all complete, requiring no judgement from the executor). Writing design work as a [机核] order means making the executor take your design decisions, and no machine-checkable receipt can make up for that.
 
-Quota discipline: reading large files and running long batches go to layer C. When a subagent reports 403, first **sort by type** — quota wall / authentication failure / network failure: on a quota wall, save progress first and back off waiting, then continue with `Agent(resume=...)` once it recovers, without restarting; **no unlimited retries**; authentication/network are handled per their own cause; if the model/proxy/parameters change, record it as a new execution condition and do not automatically inherit the old acceptance.
+Quota discipline: reading large files and running long batches go to layer C. When a subagent reports 403, **split it by type** — quota wall / auth failure / network fault: on a quota wall, save progress first, back off and wait, then resume with `Agent(resume=...)` rather than restarting; **no infinite retries**; handle auth/network by their own causes; if the model/agent/parameters change, record it as a new execution condition and do not inherit the old acceptance automatically.
 
 ## Context/token discipline (context is a cache, the taskboard is the truth)
 
-Automatic compaction only triggers near the ceiling (staying put at 70% is normal), and compaction itself burns quota — **accumulating less + externalizing state + restarting on schedule is more effective than compacting**:
+Automatic compaction only triggers near the ceiling (not moving at 70% is normal), and compaction itself costs quota — **accumulating less + externalizing state + restarting on schedule beats compaction**:
 
-1. **Externalize all state**: task books, verdicts and batch results all go to `/tmp/<TAG>/`; any agent can be killed and restarted, and after a restart it recovers from the **persisted checkpoints** (taskboard + pointer files + ACK/result files). Note that `/tmp` may be cleaned by the system: the key manifest, the final verdict and recovery pointers must be stored separately in a persistent location inside the project;
-2. **Persist in both directions**: not only is the dispatch persisted, the agent's **output is persisted too** — a report may only return "conclusion + evidence path + key numbers"; pasting large files/logs back into the conversation is forbidden (paste once and every later round carries it and burns it);
-3. **Slim the prompt**: the pane receives only a short pointer + the explicit output format (conclusion first, a few lines at most); no matter how long the task book is, it is sent as a path;
-4. **Layer C is short-lived**: claude-exec is a **stateless executor** — once a batch of machine-checkable work is done, restart it (after `/exit`, relaunch with `agent start`); do not cling to context; its memory is on the taskboard, not in the session;
-5. **Restart the review layer as needed**: codex-review's verdict history must live in a verdict file under `/tmp/<TAG>/`, and a restart recovers from the persisted checkpoints; restart when crossing tasks or after a long backlog;
-6. **Threshold checks + restart state machine**: thresholds follow each CLI's current configuration (do not write them as universal facts for all backends). The orchestrator's heartbeat `pane read` watches the status line; restarts happen only at safe checkpoints: confirm the agent is in an **able-to-receive state (idle or done)** and that artefacts/uncommitted state are on disk (do not send `/compact` while working, do not interrupt a task) → send `/compact` (supported by both claude and codex), and restart only if that has no effect. Restart sequence: `/exit` → `pane read` to confirm **it is back at the shell prompt** (this only shows the screen returned to the shell, **it does not mean the registered state has been released**) → `herdr agent list` to check the old name has disappeared from the registry → then `agent start`; if the process exists but is blocked/not-ready, troubleshoot first or wait for it to exit, and do not blindly resend.
+1. **Externalize all state**: task briefs, verdicts and batch results all land in `/tmp/<TAG>/`; any agent can be killed and restarted, and on restart it resumes from the **already-persisted checkpoint** (taskboard + pointer files + ACK/result files). Note that `/tmp` may be cleaned by the system: the key manifest, the final verdict and the recovery pointer must be saved elsewhere in a durable location inside the project;
+2. **Write to disk in both directions**: not only dispatch orders, but agents' **outputs also land on disk** — a report may only return "conclusion + evidence path + key numbers", and pasting large files/logs back into the conversation is forbidden (paste once and it is carried along every later turn, burning quota);
+3. **Slim prompts**: the pane carries only a short pointer + an explicit output format (conclusion first, a few lines at most), and however long the brief is, it is still just one path;
+4. **Layer C is short-lived**: exec-capability members are **stateless executors** — restart after a batch of machine-checkable work (`/exit` then `agent start`), with no attachment to their context; their memory is the taskboard, not the session;
+5. **Restart the review layer as needed**: rev-capability members' verdict history must live in the verdict files under `/tmp/<TAG>/` and resume from the persisted checkpoint on restart; restart after a long backlog or across tasks;
+6. **Threshold patrol + restart state machine**: thresholds follow each CLI's current configuration (not written as a universal fact about all backends). The orchestrator's heartbeat checks the status bar with `pane read`; restart only at a safe checkpoint: confirm that agent is in a **receiving state (idle or done)** and that artifacts/uncommitted state are on disk (do not send `/compact` while working, do not interrupt a task) → send `/compact` (both claude and codex support it), and restart only if that fails. Restart sequence: `/exit` → `pane read` to confirm **the shell prompt is back** (this only means the screen is back at a shell, **not that the registry entry has been released**) → `herdr agent list` to verify the old name is gone from the registry → then `agent start`; when the process is alive but blocked/not-ready, troubleshoot first or wait for it to exit, and never resend blindly. **The difference for members without hooks (genox)**: there is no registry to check, so the `herdr agent list` step of the restart sequence becomes a `pane read` confirming the process has exited and the shell prompt is back (see clause 4 of the genox entry under "Backend profiles").
 
-## Quota exhaustion contingency (quota is a schedulable resource, not an incident)
+## Quota-exhaustion contingency (quota is a schedulable resource, not an incident)
 
-Running out of quota (the 5h window / daily quota) is, like a network disconnect, a **normal external event**, and the principle is to absorb it rather than tough it out:
+Quota exhaustion (5h window/daily allowance) is a **routine external event** like a network drop; the principle is to absorb it, not to fight it:
 
-1. **Detection goes into the heartbeat**: the orchestrator uses `pane read` to catch quota signals (codex status line `5h limit: N% left · resets at HH:MM` — **this is an example from the author's environment, not a detection contract**: status-line items are configurable and versions/authentication methods differ, so the truth is whatever `/status` measures; if it is not shown or cannot be obtained, mark it **unknown** and do not treat it as sufficient); a kimi 403 is only a candidate signal, so sort it per the "Quota discipline" item into "quota / authentication / network" before entering the handling chain. The same account may be subject to several limits at once (e.g. a 5h window + a weekly limit), so observe them separately. **Below 30%, record it on the taskboard and tighten dispatching** (dispatch only critical tasks; pause critical acceptance — this is our own scheduling policy, not a vendor-guaranteed safety threshold);
-2. **Quota-pool independence must be verified, and cannot be inferred from the CLI name**: different CLIs may sit on the same billing account (when Claude uses an API key and Copilot uses BYOK, the two CLIs burn the same pool). Before substituting, check **provider + authentication method + billing account/organization + quota bucket and window** item by item, and only call it quota failover once the candidate is confirmed not to be constrained by the exhausted bucket; changing the client alone does not count. The verification record contains no keys;
-3. **Swapping brains to recover presupposes externalized state**: with the taskboard + manifest + task ID on disk, a substitute recovers from the **last confirmed checkpoint** — note that the interrupted scene may be "executed but not yet reported", so before taking over, check the artefacts/processes/commits and confirm the old executor has stopped writing; register any necessary re-run on the taskboard. The recovery promise is limited to "not repeating work already verified as done", and does not promise that any interruption is lossless;
-4. **The contingency chain is per role**: review drops → ① wait for the reset window ② backup review (borrowed, after notifying its orchestrator first) ③ substitute review (labelled as downgraded, **does not serve as the final release signature**); execution drops → swap the backend per substitute team assembly (the constraint that review/execution use different backends still applies);
-5. **The quality tier is not lowered to save quota**: final review and critical gates keep their established reasoning effort; do not run critical acceptance on the last train of the quota — better to wait for the reset. (The author's single observation on 2026-10-09: at medium effort and with low remaining quota, a deterministic bug was still caught — the evidence for the bug itself is /tmp/skill-review/verdict-r5.md; the effort tier and the remaining-quota number are observations of the orchestrator's status line via `pane read` at the time, **not archived and not independently verified, labelled as such**; this is a single observation, not proof that medium is generally sufficient; low was never tested, and is not used for final review);
-6. **Quota goes on the taskboard**: before dispatching a large task, record the current remaining amount, the quota bucket/window and the reset time (this is pre-registration); the consumption trend afterwards is review data, and the two are recorded separately.
+1. **Detection goes into the heartbeat**: the orchestrator's `pane read` catches quota signals (codex status bar `5h limit: N% left · resets at HH:MM` — **this is an example from the author's environment, not a detection contract**: status-bar items are configurable and vary by version/auth method, so trust `/status` as measured; if it is not shown or cannot be read, mark it **unknown** and do not treat it as plentiful); a kimi 403 is only a candidate signal, and per the "quota discipline" item it is first split into "quota/auth/network" before entering the handling chain. One account may hold several limits at once (e.g. a 5h window plus a weekly one), so observe them separately. **<30% means noting it on the board and tightening dispatch** (dispatch only critical tickets; pause critical acceptance — this is our own scheduling policy, not a vendor-guaranteed safety threshold);
+2. **Quota-pool independence must be verified, and cannot be inferred from the CLI name**: different CLIs may sit on one billing account (with a Claude API key or Copilot BYOK, two CLIs burn the same pool). Before substituting, check **provider + auth method + billing account/organization + quota bucket and window** item by item, and confirm the candidate is not bound by the exhausted bucket before calling it quota disaster recovery; switching clients alone does not count. The verification record contains no keys;
+3. **Swapping brains works only because state is externalized**: with the taskboard + manifest + task IDs on disk, the substitute resumes from the **last confirmed checkpoint** — noting that the interruption scene may be "finished executing but not yet receipted", so before taking over, check the artifacts/processes/commits and confirm the old executor has stopped writing; necessary re-runs are registered on the board. The recovery promise is limited to "not repeating work already verified complete", and does not promise that any interruption is lossless;
+4. **The contingency chain is by capability**: rev capability down → ① wait for the reset window ② borrow a review (from **another rev-capability member**, possibly across tasks/tabs, telling its orchestrator first and returning it on recall) ③ substitute review (labelled as degraded, **never as the final release signature**); exec capability down → swap the backend per "Team assembly and substitutes" (the rev/exec not-same-origin constraint still applies);
+5. **The quality tier is not lowered to save quota**: final verdicts and critical gates keep their configured reasoning level; do not run critical acceptance on the last bus, and prefer waiting for a reset. (The author's single observation on 2026-10-09: at medium level with low remaining quota it still caught a deterministic bug — the bug's evidence is /tmp/skill-review/verdict-r5.md; the level and the remaining-quota number are what the orchestrator saw in the status bar at the time, **not archived and not independently verified, stated as-is**; this is a single observation, not proof that medium is generally sufficient; low has not been tested and is not used for final verdicts);
+6. **Quota goes onto the board**: before dispatching a large ticket, record the current remaining amount, the quota bucket/window and the reset time (this is pre-registration); the consumption trend afterwards is retrospective data, and the two are recorded separately.
 
-## Step 3: Communication protocol (criteria for delivery and re-delivery)
+## Step 3: communication protocol (delivery and re-delivery criteria)
 
-- **Every task carries a task ID** (T001/T002…, consistent with the taskboard entry); before sending, confirm the other side is in an **able-to-receive state: `idle` or `done`** (done can equally accept input); do not send while `working` (that is the previous task running), and troubleshoot `blocked` first;
-- Prefer sending with `herdr agent prompt <name> "..." --wait --timeout <ms>` (with a finite timeout); check the returned blocked/stalled/timeout;
-- **The criterion for acceptance/completion is the ACK/result file on disk, and it must be bound to the task ID + the current batch** (batch id/bootstrap ID); do not rely on a single status observation: `working` is only a **supporting observation** — a short task may finish before `agent get` ever sees it (working is simply never observed); and if the other side was already working, seeing working does not prove the new task has started;
-- Before re-delivering, first check the ACK and the artefacts (result file, process, commit); **the task must be idempotent** (safe to re-run), so that a re-delivery after a timeout does not become a duplicate execution;
-- Long bodies/task books **go to disk under /tmp/<TAG>/ and only the path is sent**; the pane receives only a short pointer (the pane channel was measured to lose long text);
-- The codex backend occasionally reports connection failed: first troubleshoot from your own network egress (see the appendix for the author's original environment); once it is confirmed to be a network problem and the previous task truly was not executed, re-deliver per the re-delivery flow above; if it is still unusable → **backup review** (borrow the review backend from the other line, notifying its orchestrator first, and return it as soon as it is recalled);
-- Long tasks get a heartbeat cron (avoiding :00/:30), deleted once the loop closes; **a cron belongs to the current session, and a new session must recreate it**.
+- **Every ticket carries a task ID** (T001/T002…, matching the board entry); before sending, confirm the **target slot's** agent is in a **receiving state: `idle` or `done`** (done is equally input-ready); do not send while `working` (that is the previous ticket running), and troubleshoot `blocked` first. **Members without hooks do not have this set of status semantics**, and their "receiving" is judged by "no active output in pane read + the previous ticket's ACK already on disk" (see the genox entry under "Backend profiles");
+- Prefer sending with `herdr agent prompt <agent full name> "..." --wait --timeout <ms>` (with a bounded timeout); check the return for blocked/stalled/timeout. **Members without hooks (genox) do not take this path**; send a short pointer over the pane channel instead;
+- **The criterion for acceptance/completion is the on-disk ACK/result file, and it must be bound to the task ID + that batch** (batch number/bootstrap ID); do not rely on a single status observation: `working` is only a **supporting observation** — a short task may finish before `agent get` (working is never seen), and when the other side was already working, seeing working does not prove the new ticket has started;
+- Before re-delivering, check the ACK and the artifacts (result file, process, commit), and **the task must be idempotent** (safe to re-run), so a timeout re-delivery does not become duplicate execution;
+- Long bodies/briefs **land on disk at /tmp/<TAG>/ and the path is sent**, with only a short pointer in the pane (the pane channel has been measured dropping long text);
+- Troubleshoot network faults per each CLI profile's own note (e.g. the codex-over-VPN note is in "Backend profiles"); once it is confirmed to be a network problem and the previous ticket was definitely not executed, re-deliver per the flow above; if it is still unavailable → **borrow a review** (from another rev-capability member, telling its orchestrator first and returning it on recall);
+- Hang a heartbeat cron for long tasks (avoiding :00/:30) and delete it once the loop closes; **a cron belongs to the current session and must be recreated in a new session**.
 
-## Step 4: Acceptance culture
+## Step 4: acceptance culture
 
-- A fix-type change must have **two pieces of evidence: red before, green after**;
-- The orchestrator personally re-checks the key numbers (re-run/re-compute) rather than relaying them;
-- "Should be identical" ≠ "measured identical"; static declarations and measurements are written separately;
-- **An acceptance gate must include behavioural probes**: for executable things such as validation predicates, ACK comparisons and startup parameter sets, the gate must **construct adversarial samples and actually run them** — contradictory fields, empty values, duplicate lines, wrong paths, lock contention, leftover directories, each class needs a sample that can be judged red/green; grepping a string does not count as acceptance (whether a string is present and whether the predicate judges correctly are two different things — the first four rounds of gates on 2026-10-09 were all green, and they went red the moment behavioural samples ran). The adversarial sample sets are in `/tmp/skill-review/` and `/tmp/skillfix/r*-evidence/`, and can be copied;
-- **The gate script itself must also be verified**: after writing a gate, first prove it can go red and green; when the pattern string starts with `-` you must add a `--` separator such as `grep -qF -- "$3"`, since misplaced arguments make the gate silently mis-check (the orchestrator made this mistake twice on 2026-10-09); after changing a gate, replay at least one sample on which "the old implementation must go red";
-- Statements of your own that were overturned get an honest correction record.
+- Fix-type changes require both pieces of evidence: red before, green after;
+- The orchestrator personally re-checks the key numbers (re-running/re-computing), and does not relay them;
+- "should be identical" ≠ "measured identical"; static claims and measurements are written separately;
+- **The acceptance gate must contain behavioural probes**: for executable objects such as validation predicates, ACK comparisons and launch parameter sets, the gate must **construct adversarial samples and actually run them** — contradictory fields, empty values, duplicate lines, wrong paths, lock contention and leftover directories each need a sample that can be judged red/green; grepping a string does not count as acceptance (whether a string is present and whether a predicate judges correctly are two different things — the first four rounds of gates were all green on 2026-10-09, and the behavioural samples went red on the first run). The adversarial sample sets are in `/tmp/skill-review/` and `/tmp/skillfix/r*-evidence/`, ready to copy;
+- **The gate script itself must also be verified**: once written, first prove it can go red and green; a pattern string starting with `-` must use `grep -qF -- "$3"` with a `--` separator, since misplaced arguments make the gate silently mis-check (the orchestrator made this mistake twice on 2026-10-09); after changing a gate, replay at least one sample that "the old implementation must fail";
+- Words of your own that were overturned are kept as a correction record, honestly.
 
-## Step 5: Freezing and parallelism
+## Step 5: freezing and parallelism
 
-- **Freeze the repository** during a large computation batch (each fold reading the live tree with a new process); freezing/unfreezing is announced by the orchestrator;
-- Realistic data scale exposes defects a demo cannot show (soft scoping, outer joins, type chunking) — the acceptance evidence needs at least one copy at real data scale.
+- Freeze the repository during large compute batches (each fold spawns a new process reading the live tree); the orchestrator announces freezing/unfreezing;
+- Real data scale exposes defects a demo cannot see (soft scoping, outer joins, typed chunking) — the acceptance evidence needs at least one copy at real-data scale.
 
-## Launch message template
+## Launch script template
 
-> Task: <one sentence>. I (kimi-orch) orchestrate + accept; codex-review (high reasoning effort) and claude-exec (limited to [机核]) have been created.
-> Taskboard: /tmp/<TAG>/taskboard.md. Discipline: commit with line prefix, add by path, full suite serially, persist to disk and send pointers.
-> Dispatches carry a task ID and base commit; receipts are the ACK/result files on disk, and `working` counts only as a supporting observation.
+> Task: <one sentence>. I (the orch-slot member) orchestrate + accept; this team (roster): <list per slot: full name / backend / model+reasoning level / parameter set>.
+> Taskboard: /tmp/<TAG>/taskboard.md. Discipline: prefixed commits, path-scoped add, serialized full suite, on-disk pointers.
+> Tickets carry a task ID and a base commit; receipts are the on-disk ACK/result file that counts, with `working` only a supporting observation; members without hooks are judged by "pane read + on-disk ACK".
 
 ## Pre-release smoke checklist
 
-Go through it item by item before sharing/releasing. Evidence has four tiers; the vague [measured] is retired: **[real run]** = the command/script was actually executed, with input and result paths kept; **[prefix modelling]** = only a textual comparison of the command string against the rule list/predicate, with no real execution; **[static reasoning]** = manual reasoning or a one-off enumeration, not frozen into a re-runnable record; **[not measured]** = not yet run, only required by the rules. Protocol version: **2026-10-09-r5**.
+Go through every item before sharing/releasing. Evidence has four tiers, replacing the vague [measured]: **[Real execution]** = the command/script was actually run, with input and result paths kept; **[Prefix modelling]** = the command string was only compared textually against the rule list/predicate, with no real run; **[Static inference]** = manual reasoning or a one-off enumeration, not fixed into a re-runnable record; **[Not tested]** = not yet run, merely a rule requirement. Protocol version: **2026-10-10-r6**.
+
+> A row ending in **T001-d** means that row's probe is to be run by T001-d; **this table only states the requirement and does not claim execution before the evidence lands** — when you see T001-d and T001-d has not yet receipted, read it as [not tested].
 
 | # | Check | Status and evidence |
 |---|---|---|
-| 1 | Parameter validation: empty / over-long / illegal characters / **multi-line injection** are all rejected; and **the model gate precedes any command containing TAG** | **[real run]** 2026-10-09: the bash `[[ =~ ]]` whole-string check was run case by case over 8 examples, 1 allowed and 7 rejected (evidence `/tmp/skillfix/r3-evidence/tag-validation.txt`); the item "the expanded value is first judged by reading it in the model" itself is [not measured] (it requires actually invoking the Kimi template engine with an illegal $tag) |
-| 2 | Reentry with the same tag: the three names match exactly + same tab + **each role's cwd == the expected worktree (compared after `os.path.realpath()` normalization on both sides, so a path built with `..` and the canonical path pointing at the same directory must compare equal)**; a missing `tab_id`/`workspace_id` is fail-closed | **[real run]** 2026-10-09: 6 samples — **new positive case** where the expectation carried `..` while the actual cwd was the canonical path → 0; same tab with all cwds correct → 0; all cwds wrong → 3; missing topology field → 3; cross-tab → 3; missing role → 2 (evidence `/tmp/skillfix/r4-evidence/reuse-realpath.txt`; the r3 topology 5 samples in `/tmp/skillfix/r3-evidence/reuse-topology.txt`); **backfill and rollback on failure** [not measured] |
-| 3 | Partial team-assembly failure: if no process was created, resend on the same pane; if the process exists but is blocked/not-ready, troubleshoot first | [not measured] |
-| 4 | No substitute solution: report no solution only after enumerating all (review, execution) candidate pairs | **[real run]** 2026-10-09 script: with review candidates = [codex,kimi] and execution candidates = [codex], the greedy rule wrongly reported no solution while enumeration found kimi reviewing + codex executing (script and output: `/tmp/skillfix/r3-evidence/role-pair-enum.txt`); a live drill [not measured] |
-| 5 | deny negative case (B1): `git push origin HEAD:main`, `git push origin --force` | **[real run]** a temporary Git command was really run: the local bare remote's main was actually rewritten (evidence `/tmp/skill-review/evidence.json`) |
-| 5b | deny negative case (B1), remaining forms: `+refspec`, the `git -C` wrapper, `upstream main`, argument-less `push` | **[prefix modelling]** a textual comparison of the command string against the rule list, with no real Git execution record; the end-to-end negative case inside the permission engine is [not measured] |
-| 6 | deny negative case (N1): the template name `.env.example` is not matched by any deny rule (enumerate dangerous forms, do not rely on a whitelist) | **[prefix modelling]** rule-intersection comparison (fnmatch, 2026-10-09); the final decision inside the engine is [not measured] |
-| 7 | Restart recovery: `/exit` → prompt → `herdr agent list` to check the old name has been released → relaunch | [not measured] |
-| 8 | Model parameters: `-m <slug> -c model_reasoning_effort=high` takes effect (both segments in the status line + a test message that does not pop a 400) | Effective after the fix, to be verified [not measured]; the pitfall (treating the whole string as a model name → 400) **[real run]** 2026-10-09 |
-| 9 | bootstrap: only when the ACK is **exactly equal to the full text of `/tmp/<TAG>/ack-expected` (`cmp -s`)** does "launch complete" count — contradictory fields, duplicate fields, extra lines, missing lines and trailing spaces are all rejected; task identity comes from the manifest (absolute project root + each role's expected cwd + creation time + bootstrap ID), and reentry does a **unique parse**: each required field exactly one line with a non-empty value, a field name appearing twice rejected; before reading or writing the task directory/files, check that they are not symlinks (`[ -L ]`) and that the owner is yourself; one TAG allows only one launch flow at a time (launch.lock) | **[real run]** the ACK 7 samples are unchanged from r4 (evidence `/tmp/skillfix/r4-evidence/cmp-ack.txt`); **r5 re-tested with the new predicates**: manifest unique parse 8 samples + directory safety 5 samples (evidence `/tmp/skillfix/r5-evidence/manifest-unique-parse.txt`, `/tmp/skillfix/r5-evidence/dir-guard.txt`; the old r4 manifest 4 samples are superseded by the new evidence); a live launch ACK [not measured] |
-| 10 | Dispatch status semantics: the `done` state can receive tasks; the ACK is bound to the task ID + the current batch; `working` is not a criterion | [not measured] |
-| 11 | Mode selection: the three gates' evidence goes to `/tmp/<TAG>/mode-selection.md` → all pass uses the unattended parameter set, any failure uses the attended parameter set (no bypass/auto is sent to the execution line; **when attended, claude gets an explicit `--permission-mode default` and codex an explicit `-a on-request -c approvals_reviewer=user`, neither accepting inheritance of this machine's unaudited defaults**) | **[static reasoning]** the two parameter sets being chosen by gate result is manual reasoning; launching once in each mode on a live machine is [not measured] |
-| 12 | claude's effective rules, the **effect check**: `/status` (`/permissions`) to see the settings sources and the effective rules, with the entries pasted onto the taskboard; if it cannot be verified → fall back to attended and **stop first, then relaunch in explicit manual mode and re-verify**; after startup verify the real mode (`pane read` / `/status`), and if manual mode cannot be verified = the gate failed, stop dispatching | [not measured] (the rule-intersection comparison in row 6 is [prefix modelling], which is not the same as being in effect inside the engine) |
-| 13 | The parameter sets are bash arrays and `"${ARR[@]}"` makes each element its own argv: a path containing a space is not split, and the Zsh scalar non-splitting problem does not reappear; an empty parameter set `=()` expands to nothing | **[real run]** 2026-10-09: bash 5.2.21 and zsh 5.9 × two modes × two paths (including `/tmp/skill space`), 8 samples in all — the array form is item-by-item correct on both sides; the old scalar string was split into two items at the space path in bash and became one single argument in zsh (evidence `/tmp/skillfix/r4-evidence/argv-arrays.txt`) |
-| 14 | Attended mode lands: dispatching resumes only after an explicit `--permission-mode default` **and** the real manual mode verified after startup; codex gets an explicit approval policy/approver with `pane read` confirming what is displayed ( `on-request` only guarantees "it asks when requested", not that every command asks a person); existing sessions are not subject to startup parameters and must be stopped before relaunching; the kimi-orch rename exception is narrowed to "mode acceptance passed, or the user has persisted the authorization scope to `mode-selection.md`" (`--auto` = Never Ask, presence ≠ user approval) | [not measured] (documentation basis: since claude `v2.1.283`, not passing bypass may still inherit auto or the user's `defaultMode`; this machine's codex user config `approval_policy = "never"` is a read-only narrow read) |
-| 15 | **Classify before taking the lock** (N3): the complete chain empty directory → classified "new" → take the lock → create the manifest → ACK exactly equal → release; a leftover directory (non-empty, no manifest) is rejected before the lock is taken; a concurrent lock grab for the same TAG is rejected; deleting the lock to turn things green is never allowed | **[real run]** 2026-10-09: the whole "first-run flow block" was extracted from the SKILL and really run (real filesystem; the other side's ACK was a stub, no agents started), 4 branches + an ordering probe for the gates (classification line number < lock-taking line number), evidence `/tmp/skillfix/r5-evidence/lock-flow.txt`; launching real agents [not measured] |
+| 1 | Parameter validation: **tag keeps its existing 8 cases**; **roster adds at least 6 cases**: empty string, containing a space, containing uppercase, containing a newline, illegal slot name, duplicate slot, N=1, out-of-range segment count — all rejected; and **the model gate runs ahead of any command containing $tag/$roster** | **[Real execution] T001-d** (tag's 8 cases reuse the 2026-10-09 evidence `/tmp/skillfix/r3-evidence/tag-validation.txt`, 1 accepted and 7 rejected; the roster's ≥6 cases and "the model gate comes first" are to be really run by T001-d). "The expanded value first goes through the model's reading judgement" is itself [not tested] (it needs a real call into the Kimi template engine fed an illegal `$tag`/`$roster`) |
+| 2 | Re-entry with the same tag: **one reuse-check group each for N ∈ {2,3,4}**; r5's 6 sample criteria (realpath equality, missing-topology fail-closed, cross-tab, missing role) replayed sample by sample at N=2 and N=4 | **[Real execution] T001-d** (r5's original evidence `/tmp/skillfix/r4-evidence/reuse-realpath.txt`; exit-code criteria unchanged: 0 reusable / 2 missing members / 3 fail-closed. The replay after generalizing N is to be really run by T001-d); **partial team creation and failure rollback** [not tested] |
+| 3 | Partial team-creation failure: a process not created can be resent on the same pane; a process alive but blocked/not-ready is troubleshot first | [Not tested] |
+| 4 | No substitute solution: report no solution only after enumerating all candidate combinations | **[Real execution]** 2026-10-09 script: with review candidates = [codex,kimi] and execution candidates = [codex], the greedy rule wrongly reports no solution while enumeration yields kimi reviews + codex executes (script and output: `/tmp/skillfix/r3-evidence/role-pair-enum.txt`); the generalized enumeration **by slot candidate pool × all combinations** has not been exercised on a real machine [not tested] |
+| 5 | deny negative case (B1): `git push origin HEAD:main`, `git push origin --force` | **[Real execution]** temporary Git commands really run: the local bare remote's main was actually rewritten (evidence `/tmp/skill-review/evidence.json`) |
+| 5b | deny negative case (B1), remaining forms: `+refspec`, the `git -C` wrapper, `upstream main`, bare `push` | **[Prefix modelling]** the command string compared textually against the rule list, with no real Git execution recorded; an end-to-end negative case inside the permission engine is [not tested] |
+| 6 | deny negative case (N1): the template name `.env.example` is matched by no deny rule (enumerate dangerous forms, do not rely on a whitelist) | **[Prefix modelling]** rule-intersection comparison (fnmatch, 2026-10-09); the final verdict inside the engine is [not tested] |
+| 7 | Restart recovery: `/exit` → prompt → `herdr agent list` verifies the old name has been released → relaunch (**members without hooks use pane read to confirm the process has exited instead**) | [Not tested] |
+| 8 | Model parameters: `-m <slug> -c model_reasoning_effort=high` takes effect (both status-bar segments + a test message that does not return 400) | Effective after the fix, pending verification [not tested]; the pitfall (the whole string as a model name → 400) **[Real execution]** 2026-10-09 |
+| 9 | bootstrap: only an ACK **byte-identical (`cmp -s`)** to `/tmp/<TAG>/ack-expected` counts as "launch complete" — contradictory fields, duplicate fields, extra lines, missing lines and trailing spaces are all rejected; **green samples for N ∈ {2,3,4} plus red samples for each N**; task identity reads the manifest, and re-entry does a **unique parse**: each required field exactly one line with a non-empty value, a field name appearing twice being a rejection; adversarial samples for the manifest unique parse **on the roster line**: roster line missing / duplicated / mismatching the cwd slot set / cwd line count ≠ N; **replay ≥1 sample where "the old r5 parser must fail on a roster line"** | **[Real execution] T001-d** (r5's 8 sample criteria are kept and extended by N: 7 ACK samples `/tmp/skillfix/r4-evidence/cmp-ack.txt`, 8 manifest-unique-parse samples and 5 directory-safety samples `/tmp/skillfix/r5-evidence/manifest-unique-parse.txt`, `/tmp/skillfix/r5-evidence/dir-guard.txt`; the N generalization and the roster-line adversarial samples are to be really run by T001-d); a real-machine launch ACK is [not tested] |
+| 10 | Dispatch status semantics: `done` can receive a ticket; the ACK is bound to the task ID + that batch; `working` is not a criterion; **a member without hooks has the receiving condition "no active output in pane read + the previous ticket's ACK already on disk"** | [Not tested] |
+| 11 | Mode selection: three-gate evidence lands in `/tmp/<TAG>/mode-selection.md` → all pass uses the unattended parameter set, any failure uses the attended set (no bypass/auto sent to execution slots; **the attended set is given explicitly per CLI profile** — claude explicit `--permission-mode default`, codex explicit `-a on-request -c approvals_reviewer=user`, neither accepting an unaudited machine default by inheritance) | **[Static inference]** choosing between the two parameter sets by gate outcome is manual reasoning; expanding the parameter-set table per CLI is manual reasoning; launching once in each mode on a real machine is [not tested] |
+| 12 | claude **effect check** of effective rules: `/status` (`/permissions`) to see settings sources and effective rules, with the entries pasted onto the board; if unverifiable → fall back to attended and **stop before relaunching with the explicit manual mode and re-verifying**; verify the real mode after launch (`pane read`/`/status`), and if the manual mode cannot be verified the gate has failed and dispatching stops | [Not tested] (the rule-intersection comparison in row 6 is [prefix modelling] and is not the same as effect inside the engine) |
+| 13 | Parameter sets are bash arrays and `"${ARR[@]}"` expands to one argv each: a path containing spaces is not split and the Zsh scalar-no-word-splitting problem does not recur; an empty parameter set `=()` expands to nothing | **[Real execution]** 2026-10-09: bash 5.2.21 and zsh 5.9 × two modes × two paths (including `/tmp/skill space`), 8 samples in all — the array form is correct item by item on both sides; the old scalar string split into two items on a spaced path in bash and collapsed the whole group into one argument in zsh (evidence `/tmp/skillfix/r4-evidence/argv-arrays.txt`) |
+| 14 | Attended-mode landing: give the manual set explicitly per CLI profile **and** verify the real manual mode after launch before resuming dispatch; codex's explicit approval policy/approver checked against the display with `pane read` (`on-request` only guarantees "asks when requested", not that every command asks a human); an existing session does not take launch parameters, so stop first and relaunch; the orch rename exception is narrowed to "mode acceptance has passed OR the user landed the authorized scope in `mode-selection.md`" (`--auto` = Never Ask, being present ≠ user approval) | [Not tested] (documentation basis: from claude `v2.1.283`, not passing bypass may still inherit auto or the user's `defaultMode`; this machine's codex user config `approval_policy = "never"` is a read-only narrow read) |
+| 15 | **Classify before taking the lock** (N3): the full chain empty directory → classified "new" → lock taken → manifest written → ACK identical → released; **run the whole chain with an N=4 roster**; a leftover directory (non-empty, no manifest) is rejected before the lock is taken; a concurrent grab of the same TAG's lock is rejected; deleting the lock to force green is not allowed anywhere | **[Real execution] T001-d** (r5's original evidence: `/tmp/skillfix/r5-evidence/lock-flow.txt`, 4 branches + the gate-order probe; running the whole chain with an N=4 roster is to be really run by T001-d); a real agent launch is [not tested] |
+| 16 | **Pairwise-constraint validator**: green = the current default trio; red = a same-CLI pair and a cross-CLI same-family pair; **the error wording matches the frozen text in the SKILL**; the gate script proves it can go red and green | **[Real execution] T001-d** (≥1 sample per class) |
+| 17 | **Layout and naming**: static inference of the pane split order (right→down loop) and the rename loop for N=2/3/4 + **a pane-by-pane consistency check of N=3 against the r5 layout** | **[Static inference]** + a real-machine launch [not tested] |
+| 18 | **genox slot launch**: the launch command really run; the no-confirmation path backfilled per `/tmp/genox/T001-b-result.md`; verifying that the "attended + pointer over the pane + on-disk ACK" loop works with a stub on the other side | **[Real execution] T001-d** (depends on T001-b); the part T001-b already established is in the genox entry under "Backend profiles"; **end-to-end unattended completion is still [not tested]** (this machine has no external network) |
 
-## Appendix: the original author's experience (not universal facts; verify in your own environment)
+## Appendix: the original author's experience (not universal facts; verify against your own environment)
 
-- Quota: kimi/codex quota is fairly tight, so reading large files and running long batches should go to layer C as far as possible;
-- Backend choice: each person decides what backend claude-exec mounts, and backends with unstable output get only machine-checkable work;
-- 2026-10-08 shared-index incident: `git add -A` swept away changes another line had staged;
-- Measured pitfalls on 2026-10-09: an over-long tag reported `invalid_agent_name`; an earlier silent truncation made two tags collide (since removed); `-m "GPT-6.1-Sol high"` treated the whole string as a model name, and `-m` reported no error, blowing up with a 400 only on the first request;
-- The pane channel loses long text: in the author's environment the same message was lost four times in one day, so everything is persisted to disk and sent as a pointer;
-- Network: in the author's environment codex goes through a VPN while kimi/deepseek do not — so when only codex drops, check the VPN first; each person troubleshoots by analogy with their own egress situation.
+> **Backend-specific experience (such as network egress) has moved into the "Backend profiles" section**, one entry per CLI.
+
+- Quota: kimi/codex quota is tight, so reading large files and running long batches go to layer C as much as possible;
+- Backend choice: which backend to hang on the exec slot is up to each user; a backend with unstable output gets only machine-checkable work;
+- 2026-10-08 shared-index near-miss: `git add -A` swept away another line's staged changes;
+- Measured pitfalls on 2026-10-09: an over-long tag reports `invalid_agent_name`; an earlier silent truncation made two tags collide (since removed); `-m "GPT-6.1-Sol high"` as a single model name — `-m` does not complain, and it only blows up with a 400 on the first request;
+- The pane channel drops long text: the author's environment lost the same one four times in a day, hence the rule of always landing on disk and sending a pointer;
+- r5 tasks wrap up under the r5 protocol and are not migrated to r6 naming (old manifests hold fixed names like `kimi-orch-*`, whereas from r6 they are `<slot>-<tag>`; re-entry would be judged fail-closed as "not this task" — that is the current semantics, with no special case).
