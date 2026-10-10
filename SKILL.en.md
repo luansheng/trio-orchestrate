@@ -139,7 +139,7 @@ CAPS = {"orch": {"orch"}, "rev": {"rev"}, "rev2": {"rev"}, "revtest": {"rev", "e
 for _i in range(2, 10):
     CAPS[f"exec{_i}"] = {"exec"}                       # exec2…exec9 十个扩展执行线
 KNOWN_CLI = {"kimi", "codex", "claude", "copilot", "opencode", "genox"}   # 本机后端档案表;扩充档案时同步这里
-CLI_FIELDS = {                                          # 各 CLI 档案里**有**对应启动 flag 的字段(实测,见"后端档案"参数合成表):
+CLI_FIELDS = {                                          # 各 CLI 档案里**有**对应启动 flag 的字段(实测,见"后端档案"字段→启动 flag 表):
     "kimi": {"model"},                                  # 没列出的字段=该后端不支持,声明即拒,不静默丢弃
     "codex": {"model", "effort"},                       # codex: -m <model> -c model_reasoning_effort=<effort>
     "claude": {"model", "effort"},                      # claude: --model <model> --effort <level>
@@ -206,7 +206,7 @@ for m in members:
     for _f in ("model", "effort"):
         if m[_f] and _f not in _allow:
             sys.exit(f"槽位 {m['slot']}({m['cli']})不支持 {_f} 声明 {m[_f]!r}:该后端档案里没有对应启动参数,"
-                     f"声明即拒、不静默丢弃(见\"后端档案\"参数合成表);删掉该字段或换后端")
+                     f"声明即拒、不静默丢弃(见\"后端档案\"字段→启动 flag 表);删掉该字段或换后端")
 order = {"orch": 0}
 members.sort(key=lambda m: (order.get(m["slot"], 1), slots.index(m["slot"])))
 out = []
@@ -258,6 +258,9 @@ guard_td() {                                            # guard + task-directory
 # The static list carries this round's new on-disk JSON snapshots (agent-list / pane-list) and the missing list (missing-slots.txt): they too must
 # refuse symlinks, have their owner checked and respect the boundary — "it is a herdr output redirect" or "the reuse check writes it itself" is no excuse
 # (2026-10-10 re-review: a symlink pass-through overwrites files outside the task directory)
+# The list contains no fixed name of the kind "temporary file for rewriting the manifest", and needs none: that step's temporary file is the unique
+# name mkstemp opens on the spot (see the "regrouping mints a new task identity number" block), so there is no fixed name to pre-place and hence no
+# existing directory entry to pass through.
 for p in "$TD" "$TD/manifest.txt" "$TD/taskboard.md" "$TD/bootstrap.md" "$TD/bootstrap-ack.md" "$TD/ack-expected" "$TD/mode-selection.md" "$TD/panes.txt" "$TD/agent-list.json" "$TD/pane-list.json" "$TD/missing-slots.txt"; do
   guard_td "$p" || { echo "task directory/file safety check failed: stop for manual confirmation"; exit 1; }
 done
@@ -487,8 +490,13 @@ export TASK_ID                                          # the task identity numb
 #   ② process evidence from the same cell: pane-info-<slot>.json's process_info.pane_id must == the pane ID from ① (evidence from a
 #      different pane may never be stitched in), the foreground process must be non-empty, its name == the CLI declared for that slot, and its cwd == expected (no process = missing, refill that one cell);
 #   ③ on-disk ACK identity: **rebuild** the N+2-line expectation from the **already uniquely parsed task identity** (TASK_ID) + tag + the current N full member names,
-#      then compare bootstrap-ack.md against it in full (an empty expectation / wrong tag / wrong bootstrap-id / wrong member order are all rejected; not an existence grep);
-# Order: first check the identity of **every member on stage**, and any inconsistency takes precedence as rc=3; only then compute the missing set, and rc=2 reports only the missing slots.
+#      then compare bootstrap-ack.md against it **byte for byte** (a bytes comparison; an empty expectation / wrong tag / wrong bootstrap-id /
+#      wrong member order / CRLF are all rejected; not an existence grep);
+# Order: ①' every slot that has a pane record (hooked ones included) gets the **target-pane topology check** first (unique mapping → look the pane up
+#   by ID in pane list → label/tab/workspace/cwd vs the expected path): a refill is a start command sent into that very cell, so a missing member or an
+#   already-dead process does not exempt that cell from this check; a dead pane also hands its tab up to the "same tab" criterion (2026-10-10 review: the
+#   dead-process and hooked-missing-member branches used to bypass it, so members could be started in a cell of another tab / another cwd);
+# Order: ② check the identity of **every member on stage** first, and any inconsistency takes precedence as rc=3; only then compute the missing set, and rc=2 reports only the missing slots.
 # The missing list lands in $TD/missing-slots.txt (one space-separated line) for the "refill only" launch branch to read; the expected paths travel item by
 # item as argv from a **referenced bash array** (a path with spaces is not split); the parser first asserts "slot count == path count, non-empty, unique" and only then compares.
 herdr agent list > "$TD/agent-list.json"
@@ -567,18 +575,25 @@ for p in panes:
 ptxt, ptxt_ok = panes_txt()
 tabs=set(); missing=[]; why={}; hook_live=False
 for s in slots:                                         # order: every member on stage first, the missing set after (E2-4)
-    if s in hook:
-        pid=ptxt.get(s)
-        if pid is None:
-            if ptxt_ok: bad("panes.txt 在、却没有槽位 %s 的 pane 映射:不一致,fail-closed"%s)
-            missing.append(s); why[s]="还没有 pane 记录(fresh)"; continue
+    pid=ptxt.get(s)
+    if pid is not None:
+        # there is a pane record: the **target-pane topology check** comes first -- whether this cell is on stage or missing, whether its
+        # process is alive or dead, a refill means sending a start command into this very cell, so the cell must first prove it is this
+        # task's cell (ID/label/cwd/tab/workspace); a dead process also hands its tab up (tabs.add sits before the process judgement),
+        # otherwise "dead pane in another tab" would slip past the same-tab criterion
         pane=pane_by_id.get(pid)
-        if pane is None: bad("无钩子槽位 %s 的 pane %s 不在 pane list 里:fail-closed"%(s,pid))
+        if pane is None: bad("槽位 %s 的 pane %s 不在 pane list 里:fail-closed"%(s,pid))
         if pane.get("label")!=s+"-"+tag:
-            bad("pane %s 的 label=%r ≠ %s:证据不是同一格,fail-closed"%(pid,pane.get("label"),s+"-"+tag))
+            bad("pane %s 的 label=%r ≠ %s:目标格不是本任务这一格,fail-closed"%(pid,pane.get("label"),s+"-"+tag))
         if not pane.get("tab_id") or not pane.get("workspace_id"): bad("pane %s 缺 tab_id/workspace_id:fail-closed"%pid)
         if norm(pane.get("cwd"))!=norm(expect[s]):
             bad("pane %s 的 cwd=%s ≠ 预期 %s(realpath 规范化后仍不同):fail-closed"%(pid,pane.get("cwd"),expect[s]))
+        tabs.add(pane.get("tab_id"))
+    elif ptxt_ok:
+        bad("panes.txt 在、却没有槽位 %s 的 pane 映射:不一致,fail-closed"%s)
+    if s in hook:
+        if pid is None:
+            missing.append(s); why[s]="还没有 pane 记录(fresh)"; continue
         info=load("pane-info-"+s+".json")
         if info is None: bad("无钩子槽位 %s 缺 pane-info-%s.json(进程证据):fail-closed"%(s,s))
         pi=info.get("result",{}).get("process_info")
@@ -592,7 +607,7 @@ for s in slots:                                         # order: every member on
         if pname!=hook[s]: bad("槽位 %s pane 前台进程=%s ≠ 该槽位 CLI=%s:fail-closed,人工确认"%(s,pname,hook[s]))
         if norm(p0.get("cwd"))!=norm(expect[s]):
             bad("槽位 %s pane 进程 cwd=%s ≠ 预期 %s(realpath 规范化后仍不同):fail-closed"%(s,p0.get("cwd"),expect[s]))
-        tabs.add(pane.get("tab_id")); hook_live=True
+        hook_live=True
     else:
         w=s+"-"+tag; a=got.get(w)
         if a is None:
@@ -605,15 +620,19 @@ for s in slots:                                         # order: every member on
         tabs.add(a.get("tab_id"))
 if len(tabs)>1: bad("成员不在同一 tab: "+", ".join(sorted(str(t) for t in tabs)))
 if hook_live:                                           # a hookless instance is on stage: the on-disk ACK must equal the **rebuilt** expectation
-    want="bootstrap-id: "+taskid+"\ntag: "+tag+"\n"+"".join(s+"-"+tag+"\n" for s in slots)
+    want=("bootstrap-id: "+taskid+"\ntag: "+tag+"\n"+"".join(s+"-"+tag+"\n" for s in slots)).encode("utf-8")
     n_exp=len(slots)+2
-    ef=os.path.join(td,"ack-expected")
-    if os.path.exists(ef) and open(ef,encoding="utf-8").read()!=want:
+    def rbytes(name):                                    # read as rb: no newline normalization -- text mode folds CRLF into LF,
+        f=os.path.join(td,name)                          # which would let a CRLF ACK compare "equal", contradicting the byte-for-byte criterion
+        if not os.path.exists(f): return None
+        with open(f,"rb") as fh: return fh.read()
+    ef=rbytes("ack-expected")
+    if ef is not None and ef!=want:
         bad("落盘 ack-expected 与按任务身份重建的期望不同:身份没显式更新或被改过,fail-closed")
-    af=os.path.join(td,"bootstrap-ack.md")
-    ack=open(af,encoding="utf-8").read() if os.path.exists(af) else ""
+    ack=rbytes("bootstrap-ack.md")
+    if ack is None: ack=b""
     if ack!=want:
-        bad("无钩子槽位复用的落盘 ACK 身份不成立:与按任务身份重建的 %d 行期望不全等(空/错 tag/错 bootstrap-id/错成员序都算):fail-closed,人工确认"%n_exp)
+        bad("无钩子槽位复用的落盘 ACK 身份不成立:与按任务身份重建的 %d 行 %d 字节期望**逐字节**不等(空/错 tag/错 bootstrap-id/错成员序/CRLF/尾空格/多余字节都算):fail-closed,人工确认"%(n_exp,len(want)))
 open(os.path.join(td,"missing-slots.txt"),"w",encoding="utf-8").write(" ".join(missing)+"\n")
 if missing:
     print("缺: "+", ".join(s+"-"+tag+"("+why[s]+")" for s in missing)+":只补缺,只对这几格动手,已在场成员一个都不重启")
@@ -730,9 +749,10 @@ fi
 #    **model/effort are composed per slot** from the canonical roster;
 #    hard-coding bypass/auto is a protocol violation, and so is hard-coding the model in a shared array (two slots on the same CLI would overwrite each other).
 #    Branch on that slot's **cli** (not on the slot name): herdr agent start needs --kind (kimi/codex/claude etc.);
-#    a member whose profile declares "no hook" (genox) never enters the registry and is started straight in its pane (`pane run genox`; the version
-#    installed today, 3.0.1, reports `Missing command` for bare `genox` (measured, exit code 2), so `genox chat` is used for now; once the upstream PR
-#    merges, the bare command is equivalent to it — that equivalence is **[not tested]**; see the genox entry under "Backend profiles"),
+#    a member whose profile declares "no hook" (genox) never enters the registry and is started straight in its pane: **the interactive command is bare
+#    `genox`** (`pane run genox`; re-measured on this machine 2026-10-10 with Genox 3.0.1: the bare command enters the interactive UI, prints `Goodbye!`
+#    on EOF and exits 0); the old record "the old 3.0.1 package reports `Missing command` for the bare command, so `genox chat` is used for now" is a
+#    **historical measurement** (that package's behaviour) and only serves to explain old versions — see the genox entry under "Backend profiles"),
 #    fake no kind registration, and never call it "missing" just because it is absent from agent list.
 SLOT_ARGS=()                                            # composed output: cleared before every call
 slot_argv_of() {                                        # $1 = slot: composed only from that slot's canonical roster declaration (gate ⑧ already blocks "declared but no flag" input)
@@ -755,7 +775,7 @@ for s in $START_SLOTS; do
   [ -n "$pane" ] || { echo "slot $s has no pane (the split loop never assigned it): stop for manual confirmation"; exit 1; }
   slot_argv_of "$s" || exit 1
   case "${CLI_OF[$s]}" in
-    genox)  herdr pane run "$pane" "genox chat" ;;                    # hookless: the only usable mode = a human present; flags in "Backend profiles"
+    genox)  herdr pane run "$pane" "genox" ;;                    # hookless: the only usable mode = a human present; flags in "Backend profiles"
     kimi)   herdr agent start "$s-$TAG" --kind kimi   --pane "$pane" -- "${KIMI_ARGS[@]}"   "${SLOT_ARGS[@]}" ;;
     codex)  herdr agent start "$s-$TAG" --kind codex  --pane "$pane" -- "${CODEX_ARGS[@]}"  "${SLOT_ARGS[@]}" ;;
     claude) herdr agent start "$s-$TAG" --kind claude --pane "$pane" -- "${CLAUDE_ARGS[@]}" "${SLOT_ARGS[@]}" ;;
@@ -792,22 +812,43 @@ START_SLOTS=${START_SLOTS-$SLOTS}          # same: default to every slot only wh
 #   new launch: the identity number = the CREATE_ID minted by the first-run flow block (already in the manifest); this block only reads it;
 #   re-entry that really did start agents (refill/regroup): **explicitly mint a new identity number** — first rewrite the manifest's bootstrap-id line atomically, then rebuild the ACK expectation from it.
 #     Never carry the old number over implicitly: the old ACK is exactly what the old number certifies, so keeping it means "two generations of members share one receipt", and a broken identity chain stays invisible.
+#     The rewrite's temporary file must be **created safely on the spot**: use tempfile.mkstemp to open a unique name inside the task directory (O_CREAT|O_EXCL —
+#     a name already taken, a pre-placed symlink included, only causes a rename-and-retry and can **never open and follow** an existing directory entry); after
+#     writing, check owner / regular-file / still inside the task directory, then os.replace the directory entry; if any step fails, delete the temp file and exit.
+#     A fixed `<manifest>.tmp` written first and swapped after will not do: that is "check, then write", and a pre-placed link of that name is followed by open
+#     first, overwriting a file outside the task directory wholesale while the manifest itself turns into a link (measured in the 2026-10-10 review).
 #   re-entry that started nothing (REUSE=ok): keep the identity number from the manifest and do not resend bootstrap (everyone is on stage, the old ACK still holds).
 if [ -n "$START_SLOTS" ] && [ "$CLASSIFY" = reentry ]; then
   TASK_ID=$(date +%s)-$RANDOM
   python3 - "$TD/manifest.txt" "$TASK_ID" <<'PY' || { echo "regrouping could not mint a new task identity number (manifest unwritable): fail-closed, manual confirmation"; exit 1; }
-import os, sys
+import os, stat, sys, tempfile
 path, tid = sys.argv[1], sys.argv[2]
+d = os.path.dirname(path) or "."
 with open(path, encoding="utf-8") as f:
     lines = f.read().splitlines()
 hit = [i for i, x in enumerate(lines) if x.startswith("bootstrap-id: ")]
 if len(hit) != 1:
     sys.exit("manifest 的 bootstrap-id 行不是恰好一条:fail-closed,人工确认")
 lines[hit[0]] = "bootstrap-id: " + tid
-tmp = path + ".tmp"
-with open(tmp, "w", encoding="utf-8") as f:
-    f.write("\n".join(lines) + "\n")
-os.replace(tmp, path)                      # rewritten in the same directory: either the whole old text or the whole new text, never a half-written file
+data = ("\n".join(lines) + "\n").encode("utf-8")
+fd, tmp = tempfile.mkstemp(dir=d, prefix=".manifest.", suffix=".tmp")
+try:
+    with os.fdopen(fd, "wb") as f:
+        f.write(data); f.flush(); os.fsync(f.fileno())
+    st = os.lstat(tmp)
+    if not stat.S_ISREG(st.st_mode) or st.st_uid != os.getuid():
+        sys.exit("临时文件不是本用户的普通文件:fail-closed,人工确认")
+    if os.path.dirname(os.path.realpath(tmp)) != os.path.realpath(d):
+        sys.exit("临时文件规范化后不在任务目录内:fail-closed,人工确认")
+    os.replace(tmp, path)
+except BaseException:
+    try:
+        os.unlink(tmp)
+    except OSError:
+        pass
+    raise
+if os.path.islink(path) or not stat.S_ISREG(os.lstat(path).st_mode):
+    sys.exit("改写后 manifest 不是普通文件:fail-closed,人工确认")
 PY
 fi
 [ -n "${TASK_ID:-}" ] || { echo "the task identity number is empty (neither a new launch nor a re-entry minted one): fail-closed, manual confirmation"; exit 1; }
@@ -865,20 +906,23 @@ The layout is always: the orch position on the left (main tree); non-orch member
 ## Team assembly and substitutes (when the declared team is incomplete)
 
 - **The orch slot is irreplaceable**: the skill runs inside kimi, but the binary check still has to run (being able to run in the current session ≠ there being a kimi on PATH that can start a new instance); substitute only when the missing capability is review/execution or similar;
-- **Two-level availability check, both required**: ① `command -v <cli>` — the binary exists (a CLI on PATH that can start a new instance; being runnable in the current session does not count); ② `herdr integration status` shows `current` (the status hook is installed). A missing ② can be fixed with `herdr integration install <agent>`; if it cannot be fixed, downgrade to a spare tyre — it can start and run, but idle/working detection is unreliable, Step 3's `agent get` observation stops working, and only `pane read` by hand remains (**backends with no kind that herdr does not recognize, such as genox, are in this class — see "Backend profiles"**);
+- **The availability check has two time points; do not mix them**:
+  - **Before launch (while picking candidates)**: a hooked backend = binary + `herdr integration status` showing `current` + account/model availability; a hookless backend (genox) = binary + account/model availability (**no** integration `current` required, and its absence may never be grounds for "no solution"). This stage decides "may this candidate enter a combination";
+  - **After launch (at launch acceptance)**: a hooked backend is judged on `agent start` returning ready + `agent get` status being readable; a hookless backend on **that slot's pane being present, a process alive inside it, and the on-disk ACK identity** (the pane and the ACK only exist after launch — **unavailable at candidate-picking time, and never to be used to block a combination**);
+  A missing integration can be fixed with `herdr integration install <agent>`; if it cannot be fixed, the backend stays a spare tyre — it can start and run, but idle/working detection is unreliable, Step 3's `agent get` observation stops working, and only `pane read` by hand remains (**backends with no kind that herdr does not recognize, such as genox, are in this class — see "Backend profiles"**);
 - **Candidates must be recorded**: each candidate states the CLI kind + provider/model + that slot's capability and permission boundary; "different backend" is judged on these two items and cannot be read off the binary name alone; the candidate pool is queried **by capability** (not by fixed role):
 
-| Capability | First choice | Substitute order (examples; trust the two-level check as measured) |
+| Capability | First choice | Substitute order (examples; trust the per-backend health check as measured) |
 |---|---|---|
 | orch | kimi | none (irreplaceable) |
 | rev | codex | copilot → opencode (install the hook first) → a second kimi |
 | exec | claude | codex → copilot → opencode (install the hook first) → genox (attended set only) |
 
 - **Hard constraint: rev-capability members and exec-capability members must not be same-origin** — a same-origin blind spot means a review by one of the other is no review at all. Same-origin judgement is in the pairwise constraint under "Slots and roster declaration" (different CLI and different model family);
-- **Assemble by enumeration, not greedily**: give the candidate pool for each slot to be filled, enumerate **all combinations**, and take the first complete assignment satisfying [capability coverage + pairwise constraint + two-level health check + not the same live agent]. **The two-level health check branches by backend**: for a backend whose profile declares it **has** a status hook, check ① `command -v <cli>` binary and ② `herdr integration status` showing `current`; for a backend whose profile declares **no** hook (genox, see "Backend profiles"), ② is not required — check "that slot's pane is present, a process is alive inside it, and the on-disk ACK identity holds" instead, and **never call a genox slot unsolvable just because it lacks an integration**. Keep the existing counter-example lesson: "fixed first choice + greedy fallback down the list" stays banned — with only codex and kimi available, the legal solution is **kimi reviews + codex executes**; a greedy rule of "review has a fixed first choice, only step the execution choice down the list" would wrongly report no solution;
+- **Assemble by enumeration, not greedily**: give the candidate pool for each slot to be filled, enumerate **all combinations**, and take the first complete assignment satisfying [capability coverage + pairwise constraint + candidate health check + not the same live agent]. Keep the existing counter-example lesson: "fixed first choice + greedy fallback down the list" stays banned — with only codex and kimi available, the legal solution is **kimi reviews + codex executes**; a greedy rule of "review has a fixed first choice, only step the execution choice down the list" would wrongly report no solution;
 - Candidate health checks are at the same level as for a primary backend (binary + integration `current` + account/model availability); if enumeration still yields no legal team, **report clearly that the team cannot be assembled and stop; do not force one**;
 - **Role names are unchanged, and they are slot names, not backend names**: `rev-<tag>`/`exec-<tag>` are slot names (protocol, taskboard and communication all unchanged), while the actual backend and kind are written into the board header; `--kind` takes the actual backend (the list herdr supports follows `herdr agent start --help`);
-- Substitute CLIs have different no-confirmation parameters, so verify the mode after launch: generalized to **verify per CLI against its backend profile** (see "Backend profiles": one entry per CLI with the two-level health check, parameter sets, deny-mount capability and whether a status hook exists);
+- Substitute CLIs have different no-confirmation parameters, so verify the mode after launch: generalized to **verify per CLI against its backend profile** (see "Backend profiles": one entry per CLI with the profile-branched health check (two time points, before/after launch), parameter sets, deny-mount capability and whether a status hook exists);
 - **Deny-list mounting differs by CLI**: only the claude family has an equivalent mechanism for mounting a deny list via `--settings`; **when a non-claude execution slot has no equivalent mechanism, that slot's unattended capability is disabled along with it** — that slot switches to the attended parameter set, or gets a process-level sandbox of its own; **"just note on the board that the guard was dropped" and keep running as unattended is not allowed**.
 
 ## Step 1: put up the taskboard
@@ -933,7 +977,7 @@ Until the hard boundaries behind items 1–3 above (remote protection, credentia
 
 ## Backend profiles
 
-> One entry per backend CLI: **kind name / two-level health check / parameter sets (unattended, attended) / deny-mount capability / whether a status hook exists / entry-specific notes**. Step 0's "agent-start loop" looks parameters up here by the slot's cli; Step 0's "Mode selection" takes explicit parameters per CLI from the two-row table here. **CLI-specific experience with a raw CLI (such as network egress) is recorded here, while Step 3 keeps only general rules.**
+> One entry per backend CLI: **kind name / health check (branches on whether a status hook exists) / parameter sets (unattended, attended) / field→launch-flag table / deny-mount capability / whether a status hook exists / entry-specific notes**. Step 0's "agent-start loop" looks parameters up here by the slot's cli; Step 0's "Mode selection" takes explicit parameters per CLI from the two-row table here. **CLI-specific experience with a raw CLI (such as network egress) is recorded here, while Step 3 keeps only general rules.**
 
 **Parameter-set table (two rows — unattended / attended — × one column per profiled CLI)**:
 
@@ -945,17 +989,27 @@ Until the hard boundaries behind items 1–3 above (remote protection, credentia
 | ↑ note | when the roster contains **several claude-family slots** (e.g. `exec=claude` + `exec2=claude`), **every instance mounts the same `--settings` deny list**: the list is **mounted per instance**, not "bound to one particular slot" — the existing conclusion that it "binds only the `exec` slot and does not affect a user's own separately launched claude" is precisely the proof of per-instance mounting; when adding a claude-family slot, the launch loop still carries `--settings`, and none is left out | | | |
 | ↑ note (codex) | **Network egress (limited to the author's environment, not a general fact)**: in the author's environment codex goes through a VPN while kimi/deepseek do not — so when only codex drops, check the VPN first; each person troubleshoots by analogy with their own egress situation (Step 3's re-delivery criterion uses this note) | | | |
 | copilot / opencode / others | follow that CLI's `--help` as measured (**verify per CLI**, do not copy the values above) | same as left, explicit manual mode | none | present after `herdr integration install <agent>` |
-| **genox** | **none** (see below) | interactive `genox chat` (the attended set is its only usable set) | **none** | **none** (herdr has no genox kind/integration) |
+| **genox** | **none** (see below) | interactive **bare `genox`** (the attended set is its only usable set; only old packages need `genox chat`, see the genox entry) | **none** | **none** (herdr has no genox kind/integration) |
 
-**Two-level health check (uniform across backends)**: ① `command -v <cli>` — the binary exists; ② `herdr integration status` shows `current`. **For a backend with no kind (genox), ② is necessarily missing**, so treat it as a spare tyre: `agent get` observation stops working and only `pane read` remains.
+**Field → launch-flag table (a model/effort declared in the roster is admitted only when this table has a matching flag: step 1's ⑧ judges by it, and the agent-start loop's `slot_argv_of()` composes argv from it)**:
+
+| CLI | model | effort | Composition |
+|---|---|---|---|
+| kimi | yes | no | `-m <model>`; declaring effort is rejected outright (this table has no such flag) |
+| codex | yes | yes | `-m <model>` + `-c model_reasoning_effort=<effort>` |
+| claude | yes | yes | `--model <model>` + `--effort <level>` |
+| copilot / opencode / others | follow that CLI's `--help` as measured | same as left | an unregistered CLI that declares model/effort is rejected outright by `slot_argv_of()` (never silently dropped); add it to this table once measured |
+| **genox** | **no** | **no** | the interactive command takes no model parameters; declaring one is rejected outright |
+
+**Health check (branches on the profile's "whether a status hook exists"; no one-size-fits-all)**: ① `command -v <cli>` — the binary exists — **every backend** checks this; ② `herdr integration status` showing `current` — **only backends whose profile declares "has a hook"** check this; **a backend with no kind (genox) necessarily lacks ② — do not check it and do not install one**, treat it as a spare tyre: `agent get` observation stops working and only `pane read` remains. Each of the two branches further splits into two time points (see "Team assembly and substitutes"): **before launch** only the binary and account/model availability are checked; **after launch** the pane being present, a process alive inside it, and the on-disk ACK identity are checked — candidate-picking time must not require a pane/ACK that does not exist yet.
 
 ### The genox entry
 
 **[Real execution] facts (all evidence under `/tmp/genox/T001-b-evidence/`, Genox 3.0.1)**:
 
-- **Interactive command and flags**: the interactive launch command is written as bare **`genox`**; with the installed 3.0.1, bare `genox` reports `Missing command` (measured, exit code 2, evidence `05-genox-noargs.stderr`), so **use `genox chat` for now**; once the upstream PR lands, the bare command is equivalent to `genox chat` — **that equivalence is [not tested]**; flags only `--base-dir/-d`, `--verbose/-v`, `--help`; **chat has no no-confirmation parameter** (evidence `10-help-chat.stdout`);
+- **Interactive command and flags**: the interactive launch command = **bare `genox`**, which is the **current measured state** — re-measured on this machine 2026-10-10 (Genox 3.0.1, after pulling): bare `genox` goes straight into the interactive UI, prints `Goodbye!` on EOF, **exits 0 and does not hang**; **historical measurement (old package)**: at the time, the 3.0.1 bare command reported `Missing command` (exit code 2, evidence `05-genox-noargs.stderr`), which is why `genox chat` was once used provisionally and recorded as "the two are equivalent [not tested]" — that old record only serves to explain old versions and is no longer the current fact; flags only `--base-dir/-d`, `--verbose/-v`, `--help`; **chat has no no-confirmation parameter** (evidence `10-help-chat.stdout`);
 - **The no-confirmation flags are on `genox run`**: `--approve-generated-plan` (generate a plan and approve it directly, without asking anyone) and `--plan FILE --approve-plan` (approve a given plan file); the source `run_preflight.py:292-318` makes clear it is `interactively_reviewed=False` and, with no TTY and no approval, reports "No TTY is available and the master plan is unconfirmed. Use --plan FILE --approve-plan or --approve-generated-plan." (evidence `72-approval-source-scan.txt`, `73-interactive-detection.txt`). **End-to-end unattended completion = [not tested]**: this machine has no external network, a TCP connect to `api.openai.com:443` immediately gives `Network is unreachable` (evidence `50-network-probe.txt`), and both paths die at the model call (evidence `41-run-approve-generated-plan.stdout`, `53-run-plan-file2.stdout`);
-- **No-TTY behaviour**: `genox chat` with no TTY and `</dev/null` prints the banner and the `>` prompt, reads EOF and prints `Goodbye!`, **exit code 0, no hang** (evidence `30-chat-null-stdin.stdout`/`.exit`); in a pty it was measured reaching the interactive prompt and exiting cleanly on `/quit` (evidence `32-chat-pty.raw`); exit-code convention **0 normal / 2 usage error / 1 business rejection** (evidence `06-genox-badflag.exit`);
+- **No-TTY behaviour**: **bare `genox`** reads EOF and immediately prints `Goodbye!`, **exit code 0, no hang** (re-measured 2026-10-10, the current fact); **historical measurement**: `genox chat` with no TTY + `</dev/null` printed the banner and the `>` prompt, then read EOF and printed `Goodbye!`, exit code 0 (evidence `30-chat-null-stdin.stdout`/`.exit`); in a pty it was measured reaching the interactive prompt and exiting cleanly on `/quit` (evidence `32-chat-pty.raw`); exit-code convention **0 normal / 2 usage error / 1 business rejection** (evidence `06-genox-badflag.exit`);
 - **Process hygiene**: add **`--foreground`** to `genox run` to stop the coordinator from detaching (without it, it leaves the terminal); a failure may leave stale `.control.lock` metadata (measured: a lock file left by a dead pid, which **does not block subsequent starts** — three consecutive runs without unlock all started normally), and the cleaner is `genox unlock [slug] [--control]` (evidence `48-workspace-state.txt`, `49-lockpid-check.txt`, `10-help-unlock.stdout`);
 - **Doctor posture**: `permission mode: workspace-write`, `allow_network: True`, `confirm_destructive: True`, bubblewrap available (mode auto), 76 built-in tools, mcp disabled; configuration follows **defaults + environment variables**, `~/.genox/` is cache only with no settings/permission config file (evidence `21-genox-doctor.stdout`, `20-genox-version.stdout`, `70-config-surface.txt`).
 
@@ -1041,12 +1095,12 @@ Quota exhaustion (5h window/daily allowance) is a **routine external event** lik
 
 Go through every item before sharing/releasing. Evidence has four tiers, replacing the vague [measured]: **[Real execution]** = the command/script was actually run, with input and result paths kept; **[Prefix modelling]** = the command string was only compared textually against the rule list/predicate, with no real run; **[Static inference]** = manual reasoning or a one-off enumeration, not fixed into a re-runnable record; **[Not tested]** = not yet run, merely a rule requirement. Protocol version: **2026-10-10-r6**.
 
-> A row ending in **T001-d** means that row's probe is to be run by T001-d; **this table only states the requirement and does not claim execution before the evidence lands** — when you see T001-d and T001-d has not yet receipted, read it as [not tested].
+> A row ending in **T001-d** means that row's probe is to be run by T001-d. **That is historical evidence on 3453b4a**, covering only the scope T001-d's receipt §6 lists for itself — of which the **r5 six-sample criteria replayed only 3 branches** (realpath equality, missing members, exit code 3), and **row 17 was not done** (that passage is placeholder comment pseudo-code and cannot be mechanically extracted); it does not automatically prove the current commit's acceptance. This round's T001-i has already re-run the same batch on the new commit and tightened it, with evidence under `/tmp/genox/T001-i-evidence/`; where the two conflict, this round wins. **This table only states the requirement and does not claim execution before the evidence lands** — when you see T001-d and T001-d has not yet receipted, read it as [not tested].
 
 | # | Check | Status and evidence |
 |---|---|---|
-| 1 | Parameter validation: **tag keeps its existing 8 cases**; **roster adds at least 6 cases**: empty string, containing a space, containing uppercase, containing a newline, illegal slot name, duplicate slot, N=1, out-of-range segment count — all rejected; and **the model gate runs ahead of any command containing $tag/$roster** | **[Real execution] T001-d** (tag's 8 cases reuse the 2026-10-09 evidence `/tmp/skillfix/r3-evidence/tag-validation.txt`, 1 accepted and 7 rejected; the roster's ≥6 cases and "the model gate comes first" are to be really run by T001-d). "The expanded value first goes through the model's reading judgement" is itself [not tested] (it needs a real call into the Kimi template engine fed an illegal `$tag`/`$roster`) |
-| 2 | Re-entry with the same tag: **one reuse-check group each for N ∈ {2,3,4}**; r5's 6 sample criteria (realpath equality, missing-topology fail-closed, cross-tab, missing role) replayed sample by sample at N=2 and N=4 | **[Real execution] T001-d** (r5's original evidence `/tmp/skillfix/r4-evidence/reuse-realpath.txt`; exit-code criteria unchanged: 0 reusable / 2 missing members / 3 fail-closed. The replay after generalizing N is to be really run by T001-d); **partial team creation and failure rollback** [not tested] |
+| 1 | Parameter validation: **tag keeps its existing 8 cases**; **roster adds at least 8 cases**: containing a space, containing uppercase, containing a newline, illegal slot name, duplicate slot, N=1, out-of-range segment count, empty segment/empty value — **every illegal non-empty input is rejected**; **an empty string = fall back to the default roster, not rejected**; and **the model gate runs ahead of any command containing $tag/$roster** | **[Real execution] T001-d** (tag's 8 cases reuse the 2026-10-09 evidence `/tmp/skillfix/r3-evidence/tag-validation.txt`, 1 accepted and 7 rejected) + **T001-i re-run** (the empty-string fallback sample rc=0; the other illegal non-empty samples rc=1; see the roster counter-example group under `/tmp/genox/T001-i-evidence/`). "The expanded value first goes through the model's reading judgement" is itself [not tested] (it needs a real call into the Kimi template engine fed an illegal `$tag`/`$roster`) |
+| 2 | Re-entry with the same tag: **one reuse-check group each for N ∈ {2,3,4}**; r5's 6 sample criteria (realpath equality, missing-topology fail-closed, cross-tab, missing role) replayed sample by sample at N=2 and N=4; **pane identity parsed uniquely by ID** (label/tab/workspace/pane cwd/process cwd/process name checked item by item), **the ACK rebuilt from the parsed identity and compared in full**, **an identity mismatch takes precedence as rc=3 before the missing set is computed**, **a refill iterates only the missing slots** | **[Real execution] T001-i** (on the new commit: the same batch as T001-d, re-run, plus this round's tightened counter-examples: pane-id mismatch / pane cwd mismatch / a misattributed equal-valued ACK / empty ACK / same slot with a swapped backend / a member with the wrong cwd while a member is also missing → all rc=3; see `/tmp/genox/T001-i-evidence/`); T001-d's historical coverage is in the note above (**only 3 branches replayed**); **failure rollback** [not tested] |
 | 3 | Partial team-creation failure: a process not created can be resent on the same pane; a process alive but blocked/not-ready is troubleshot first | [Not tested] |
 | 4 | No substitute solution: report no solution only after enumerating all candidate combinations | **[Real execution]** 2026-10-09 script: with review candidates = [codex,kimi] and execution candidates = [codex], the greedy rule wrongly reports no solution while enumeration yields kimi reviews + codex executes (script and output: `/tmp/skillfix/r3-evidence/role-pair-enum.txt`); the generalized enumeration **by slot candidate pool × all combinations** has not been exercised on a real machine [not tested] |
 | 5 | deny negative case (B1): `git push origin HEAD:main`, `git push origin --force` | **[Real execution]** temporary Git commands really run: the local bare remote's main was actually rewritten (evidence `/tmp/skill-review/evidence.json`) |
@@ -1054,16 +1108,19 @@ Go through every item before sharing/releasing. Evidence has four tiers, replaci
 | 6 | deny negative case (N1): the template name `.env.example` is matched by no deny rule (enumerate dangerous forms, do not rely on a whitelist) | **[Prefix modelling]** rule-intersection comparison (fnmatch, 2026-10-09); the final verdict inside the engine is [not tested] |
 | 7 | Restart recovery: `/exit` → prompt → `herdr agent list` verifies the old name has been released → relaunch (**members without hooks use pane read to confirm the process has exited instead**) | [Not tested] |
 | 8 | Model parameters: `-m <slug> -c model_reasoning_effort=high` takes effect (both status-bar segments + a test message that does not return 400) | Effective after the fix, pending verification [not tested]; the pitfall (the whole string as a model name → 400) **[Real execution]** 2026-10-09 |
-| 9 | bootstrap: only an ACK **byte-identical (`cmp -s`)** to `/tmp/<TAG>/ack-expected` counts as "launch complete" — contradictory fields, duplicate fields, extra lines, missing lines and trailing spaces are all rejected; **green samples for N ∈ {2,3,4} plus red samples for each N**; task identity reads the manifest, and re-entry does a **unique parse**: each required field exactly one line with a non-empty value, a field name appearing twice being a rejection; adversarial samples for the manifest unique parse **on the roster line**: roster line missing / duplicated / mismatching the cwd slot set / cwd line count ≠ N; **replay ≥1 sample where "the old r5 parser must fail on a roster line"** | **[Real execution] T001-d** (r5's 8 sample criteria are kept and extended by N: 7 ACK samples `/tmp/skillfix/r4-evidence/cmp-ack.txt`, 8 manifest-unique-parse samples and 5 directory-safety samples `/tmp/skillfix/r5-evidence/manifest-unique-parse.txt`, `/tmp/skillfix/r5-evidence/dir-guard.txt`; the N generalization and the roster-line adversarial samples are to be really run by T001-d); a real-machine launch ACK is [not tested] |
+| 9 | bootstrap: only an ACK **identical in full (`cmp -s`)** to `/tmp/<TAG>/ack-expected` counts as "launch complete" — contradictory fields, duplicate fields, extra lines, missing lines and trailing spaces are all rejected; **green samples for N ∈ {2,3,4} plus red samples for each N**; task identity reads the manifest, and re-entry does a **unique parse**: each required field exactly one line with a non-empty value, a field name appearing twice being a rejection; **the re-entry expectation is rebuilt from the parsed identity and then compared in full**; **manifest adversarial samples**: roster line missing / duplicated / mismatching the cwd slot set / cwd line count ≠ N / same slot with a swapped backend / same slot with a swapped model — all rejected; **the falsified old assertion is no longer replayed**: the r5 parser **does not check** the roster line (`/tmp/genox/T001-d-evidence/`'s R2b returns rc=0 as-is), so it may never again be written as "must go red"; to get red, use samples that **genuinely get rejected**, such as cwd line count ≠ N | **[Real execution] T001-d** (7 ACK samples `/tmp/skillfix/r4-evidence/cmp-ack.txt`, 8 manifest-unique-parse samples and 5 directory-safety samples `/tmp/skillfix/r5-evidence/manifest-unique-parse.txt`) + **T001-i re-run and tightened** (identity rebuild, same slot with a swapped backend/model, cwd line count and other counter-examples under `/tmp/genox/T001-i-evidence/`); a real-machine launch ACK is [not tested] |
 | 10 | Dispatch status semantics: `done` can receive a ticket; the ACK is bound to the task ID + that batch; `working` is not a criterion; **a member without hooks has the receiving condition "no active output in pane read + the previous ticket's ACK already on disk"** | [Not tested] |
 | 11 | Mode selection: three-gate evidence lands in `/tmp/<TAG>/mode-selection.md` → all pass uses the unattended parameter set, any failure uses the attended set (no bypass/auto sent to execution slots; **the attended set is given explicitly per CLI profile** — claude explicit `--permission-mode default`, codex explicit `-a on-request -c approvals_reviewer=user`, neither accepting an unaudited machine default by inheritance) | **[Static inference]** choosing between the two parameter sets by gate outcome is manual reasoning; expanding the parameter-set table per CLI is manual reasoning; launching once in each mode on a real machine is [not tested] |
 | 12 | claude **effect check** of effective rules: `/status` (`/permissions`) to see settings sources and effective rules, with the entries pasted onto the board; if unverifiable → fall back to attended and **stop before relaunching with the explicit manual mode and re-verifying**; verify the real mode after launch (`pane read`/`/status`), and if the manual mode cannot be verified the gate has failed and dispatching stops | [Not tested] (the rule-intersection comparison in row 6 is [prefix modelling] and is not the same as effect inside the engine) |
 | 13 | Parameter sets are bash arrays and `"${ARR[@]}"` expands to one argv each: a path containing spaces is not split and the Zsh scalar-no-word-splitting problem does not recur; an empty parameter set `=()` expands to nothing | **[Real execution]** 2026-10-09: bash 5.2.21 and zsh 5.9 × two modes × two paths (including `/tmp/skill space`), 8 samples in all — the array form is correct item by item on both sides; the old scalar string split into two items on a spaced path in bash and collapsed the whole group into one argument in zsh (evidence `/tmp/skillfix/r4-evidence/argv-arrays.txt`) |
 | 14 | Attended-mode landing: give the manual set explicitly per CLI profile **and** verify the real manual mode after launch before resuming dispatch; codex's explicit approval policy/approver checked against the display with `pane read` (`on-request` only guarantees "asks when requested", not that every command asks a human); an existing session does not take launch parameters, so stop first and relaunch; the orch rename exception is narrowed to "mode acceptance has passed OR the user landed the authorized scope in `mode-selection.md`" (`--auto` = Never Ask, being present ≠ user approval) | [Not tested] (documentation basis: from claude `v2.1.283`, not passing bypass may still inherit auto or the user's `defaultMode`; this machine's codex user config `approval_policy = "never"` is a read-only narrow read) |
-| 15 | **Classify before taking the lock** (N3): the full chain empty directory → classified "new" → lock taken → manifest written → ACK identical → released; **run the whole chain with an N=4 roster**; a leftover directory (non-empty, no manifest) is rejected before the lock is taken; a concurrent grab of the same TAG's lock is rejected; deleting the lock to force green is not allowed anywhere | **[Real execution] T001-d** (r5's original evidence: `/tmp/skillfix/r5-evidence/lock-flow.txt`, 4 branches + the gate-order probe; running the whole chain with an N=4 roster is to be really run by T001-d); a real agent launch is [not tested] |
-| 16 | **Pairwise-constraint validator**: green = the current default trio; red = a same-CLI pair and a cross-CLI same-family pair; **the error wording matches the frozen text in the SKILL**; the gate script proves it can go red and green | **[Real execution] T001-d** (≥1 sample per class) |
+| 15 | **Classify before taking the lock** (N3): the full chain empty directory → classified "new" → lock taken → manifest written → ACK identical → released; **run the whole chain with an N=4 roster**; a leftover directory (non-empty, no manifest) is rejected before the lock is taken; a concurrent grab of the same TAG's lock is rejected; **path plan before it is computed: the plan is frozen into the manifest at creation, and a re-entry only restores it, never recomputes it** (a `git init` after a main-only creation must still follow the frozen plan) | **[Real execution] T001-d** (r5's original evidence: `/tmp/skillfix/r5-evidence/lock-flow.txt`, 4 branches + the gate-order probe) + **T001-i** (the whole chain run with an N=4 roster + the "main-only, then git init, then re-enter" sample green; see `/tmp/genox/T001-i-evidence/`); a real agent launch is [not tested] |
+| 16 | **Pairwise-constraint validator**: green = the current default trio; red = a same-CLI pair and a cross-CLI same-family pair; **the error wording matches the frozen text in the SKILL**; the gate script proves it can go red and green | **[Real execution] T001-d** (≥1 sample per class) + **T001-i** (the same gate script re-run: the default trio green, both classes of same-origin counter-example still red; orch=genox is likewise rejected) |
 | 17 | **Layout and naming**: static inference of the pane split order (right→down loop) and the rename loop for N=2/3/4 + **a pane-by-pane consistency check of N=3 against the r5 layout** | **[Static inference]** + a real-machine launch [not tested] |
-| 18 | **genox slot launch**: the launch command really run; the no-confirmation path backfilled per `/tmp/genox/T001-b-result.md`; verifying that the "attended + pointer over the pane + on-disk ACK" loop works with a stub on the other side | **[Real execution] T001-d** (depends on T001-b); the part T001-b already established is in the genox entry under "Backend profiles"; **end-to-end unattended completion is still [not tested]** (this machine has no external network) |
+| 18 | **genox slot launch**: the launch command really run (the current interactive command = **bare `genox`**, re-measured 2026-10-10: enters the interactive UI, EOF → `Goodbye!`, exit code 0); the no-confirmation path backfilled per `/tmp/genox/T001-b-result.md`; verifying that the "attended + pointer over the pane + on-disk ACK" loop works with a stub on the other side | **[Real execution] T001-d** (depends on T001-b); the part T001-b already established is in the genox entry under "Backend profiles" (its record of bare `genox` reporting `Missing command` while `genox chat` was used has been changed to an **old-package historical measurement**); **end-to-end unattended completion is still [not tested]** (this machine has no external network) |
+| 19 | **Write boundary for on-disk snapshots**: agent-list / pane-list / pane-info-\<slot\> / missing-slots are each checked before being written (symlinks refused, owner checked, inside the task directory); a sentinel file is placed outside the task directory and must be byte-identical after every negative sample runs | **[Real execution] T001-i** (symlink negative sample: refused before writing, external sentinel bytes unchanged; see `/tmp/genox/T001-i-evidence/`) |
+| 20 | **Per-slot model/effort**: two slots on the same CLI each compose argv from their own roster declaration (same CLI, different model/effort do not overwrite each other); a declared model/effort field with no matching flag is **rejected outright**, never silently dropped; `orch` must be kimi | **[Real execution] T001-i** (same-CLI two-slot argv counter-example + orch=genox rejection; see `/tmp/genox/T001-i-evidence/`) |
+| 21 | **Regrouping = explicitly minting a new task identity**: a re-entry that really did start agents → the manifest's bootstrap-id line is atomically rewritten to the new number → the ACK expectation is rebuilt from the new number → the old ACK is voided at once; when nothing was started (everything reusable) the old number is kept and bootstrap is not resent | **[Real execution] T001-i** (after the renumbering the old ACK goes red and the new ACK goes green; see `/tmp/genox/T001-i-evidence/`) |
 
 ## Appendix: the original author's experience (not universal facts; verify against your own environment)
 

@@ -122,7 +122,7 @@ ROSTER=$roster                     # 第二参数;为空 → 用默认声明(见
 # ④ 单编排(orch 恰好 1)且 orch 的 CLI 必须是 kimi(技能就跑在 kimi 里;genox 等无钩子后端不得承担 orch);
 # ⑤ 成对约束枚举(rev 能力 × exec 能力,不得同源);⑥ 每成员全名 ^[a-z0-9_-]{1,32}$ 且 ≤32;
 # ⑦ cli ∈ 本机后端档案表(见"后端档案";未知 CLI → "无档案,先补后端档案再拉起");
-# ⑧ 声明的 model/effort 必须在该 CLI 的档案里有对应启动 flag(没 flag 的字段点名拒绝,不静默丢弃——"后端档案"参数合成表)。
+# ⑧ 声明的 model/effort 必须在该 CLI 的档案里有对应启动 flag(没 flag 的字段点名拒绝,不静默丢弃——"后端档案"字段→启动 flag 表)。
 # 校验通过后输出规范化 roster 串(槽位序固定:orch 恒第一,其余按声明序),写进 manifest 的 roster: 行与 bootstrap,
 # 保证重入时预期集合可重建。
 # 本段是**唯一一份** roster 校验/规范化源码(下称 DSL):除本次入参外,重入时从 manifest 读回的 roster: 行
@@ -133,7 +133,7 @@ CAPS = {"orch": {"orch"}, "rev": {"rev"}, "rev2": {"rev"}, "revtest": {"rev", "e
 for _i in range(2, 10):
     CAPS[f"exec{_i}"] = {"exec"}                       # exec2…exec9 十个扩展执行线
 KNOWN_CLI = {"kimi", "codex", "claude", "copilot", "opencode", "genox"}   # 本机后端档案表;扩充档案时同步这里
-CLI_FIELDS = {                                          # 各 CLI 档案里**有**对应启动 flag 的字段(实测,见"后端档案"参数合成表):
+CLI_FIELDS = {                                          # 各 CLI 档案里**有**对应启动 flag 的字段(实测,见"后端档案"字段→启动 flag 表):
     "kimi": {"model"},                                  # 没列出的字段=该后端不支持,声明即拒,不静默丢弃
     "codex": {"model", "effort"},                       # codex: -m <model> -c model_reasoning_effort=<effort>
     "claude": {"model", "effort"},                      # claude: --model <model> --effort <level>
@@ -200,7 +200,7 @@ for m in members:
     for _f in ("model", "effort"):
         if m[_f] and _f not in _allow:
             sys.exit(f"槽位 {m['slot']}({m['cli']})不支持 {_f} 声明 {m[_f]!r}:该后端档案里没有对应启动参数,"
-                     f"声明即拒、不静默丢弃(见\"后端档案\"参数合成表);删掉该字段或换后端")
+                     f"声明即拒、不静默丢弃(见\"后端档案\"字段→启动 flag 表);删掉该字段或换后端")
 order = {"orch": 0}
 members.sort(key=lambda m: (order.get(m["slot"], 1), slots.index(m["slot"])))
 out = []
@@ -249,6 +249,8 @@ guard_td() {                                            # guard + 任务目录�
 }
 # 静态清单含本次新增的落盘 JSON 快照(agent-list / pane-list)与缺失清单(missing-slots.txt):它们也要拒符号链接、
 # 核属主、核边界,不能因为"是 herdr 输出重定向"或"是复用检查自己写的"就跳过(2026-10-10 复审:链接穿透会把任务目录外的文件覆盖掉)
+# 清单里没有、也不需要"改写 manifest 用的临时文件"这一类固定名字:那一步的临时文件是 mkstemp 当场现开的唯一名
+# (见下面"重组换任务身份号"块),没有可预置的固定名,写前也就没有可穿透的既有目录项
 for p in "$TD" "$TD/manifest.txt" "$TD/taskboard.md" "$TD/bootstrap.md" "$TD/bootstrap-ack.md" "$TD/ack-expected" "$TD/mode-selection.md" "$TD/panes.txt" "$TD/agent-list.json" "$TD/pane-list.json" "$TD/missing-slots.txt"; do
   guard_td "$p" || { echo "任务目录/文件安全核验不过:停下人工确认"; exit 1; }
 done
@@ -470,8 +472,12 @@ export TASK_ID                                          # 任务身份号随环�
 #   ② 同一格的进程证据:pane-info-<slot>.json 的 process_info.pane_id 必须 == ①的 pane ID(不许拿别的 pane 的
 #      进程证据来拼),前台进程非空,进程名 == 该槽位声明的 CLI,进程 cwd 与预期一致(进程不在 = 缺,只补这一格);
 #   ③ 落盘 ACK 身份:用**已唯一解析的任务身份**(TASK_ID)+ tag + 当前 N 个成员全名**重建** N+2 行期望,
-#      再与 bootstrap-ack.md 全文等值(空期望/错 tag/错 bootstrap-id/错成员序全拒;不是存在性 grep);
-# 顺序:先把**全部在场成员**的身份都检完,任何不一致优先 rc=3;通过后才算缺失集合,rc=2 只报缺的槽位。
+#      再与 bootstrap-ack.md **逐字节**等值(bytes 比较;空期望/错 tag/错 bootstrap-id/错成员序/CRLF 都拒;不是存在性 grep);
+# 顺序:①' 有 pane 记录的槽位(有钩子的也在内)先做**目标 pane 拓扑核验**(唯一映射 → 按 ID 查 pane list →
+#   label/tab/workspace/cwd/预期路径):补缺就是往这格里发启动指令,缺员或进程已死都不能免这道核;
+#   死 pane 也把 tab 交上来参与"同 tab"判据(2026-10-10 复审:死进程/有钩子缺员的分支曾绕过它,
+#   结果能在别的 tab / 别的 cwd 的格子上补起成员);
+# 顺序:② 先把**全部在场成员**的身份都检完,任何不一致优先 rc=3;通过后才算缺失集合,rc=2 只报缺的槽位。
 # 缺失清单落 $TD/missing-slots.txt(单行空格分隔),供"只补缺"的拉起分支读;预期路径用**引用的 bash 数组**
 # 逐项成 argv 传(含空格的路径不被拆);解析器先断言"槽位数 == 路径数、非空、唯一"再比对。
 herdr agent list > "$TD/agent-list.json"
@@ -550,18 +556,24 @@ for p in panes:
 ptxt, ptxt_ok = panes_txt()
 tabs=set(); missing=[]; why={}; hook_live=False
 for s in slots:                                         # 顺序:先全部在场成员身份,再算缺失(E2-4)
-    if s in hook:
-        pid=ptxt.get(s)
-        if pid is None:
-            if ptxt_ok: bad("panes.txt 在、却没有槽位 %s 的 pane 映射:不一致,fail-closed"%s)
-            missing.append(s); why[s]="还没有 pane 记录(fresh)"; continue
+    pid=ptxt.get(s)
+    if pid is not None:
+        # 有 pane 记录:先做**目标 pane 拓扑核验**——不管这格是在场还是缺员、进程是死是活,
+        # 补起就是往这一格里发启动指令,所以这一格必须先证明是本任务的格子(ID/label/cwd/tab/workspace);
+        # 死进程也要把 tab 交上来(tabs.add 在进程判断之前),否则"死 pane 在别的 tab"会绕开同 tab 判据
         pane=pane_by_id.get(pid)
-        if pane is None: bad("无钩子槽位 %s 的 pane %s 不在 pane list 里:fail-closed"%(s,pid))
+        if pane is None: bad("槽位 %s 的 pane %s 不在 pane list 里:fail-closed"%(s,pid))
         if pane.get("label")!=s+"-"+tag:
-            bad("pane %s 的 label=%r ≠ %s:证据不是同一格,fail-closed"%(pid,pane.get("label"),s+"-"+tag))
+            bad("pane %s 的 label=%r ≠ %s:目标格不是本任务这一格,fail-closed"%(pid,pane.get("label"),s+"-"+tag))
         if not pane.get("tab_id") or not pane.get("workspace_id"): bad("pane %s 缺 tab_id/workspace_id:fail-closed"%pid)
         if norm(pane.get("cwd"))!=norm(expect[s]):
             bad("pane %s 的 cwd=%s ≠ 预期 %s(realpath 规范化后仍不同):fail-closed"%(pid,pane.get("cwd"),expect[s]))
+        tabs.add(pane.get("tab_id"))
+    elif ptxt_ok:
+        bad("panes.txt 在、却没有槽位 %s 的 pane 映射:不一致,fail-closed"%s)
+    if s in hook:
+        if pid is None:
+            missing.append(s); why[s]="还没有 pane 记录(fresh)"; continue
         info=load("pane-info-"+s+".json")
         if info is None: bad("无钩子槽位 %s 缺 pane-info-%s.json(进程证据):fail-closed"%(s,s))
         pi=info.get("result",{}).get("process_info")
@@ -575,7 +587,7 @@ for s in slots:                                         # 顺序:先全部在场
         if pname!=hook[s]: bad("槽位 %s pane 前台进程=%s ≠ 该槽位 CLI=%s:fail-closed,人工确认"%(s,pname,hook[s]))
         if norm(p0.get("cwd"))!=norm(expect[s]):
             bad("槽位 %s pane 进程 cwd=%s ≠ 预期 %s(realpath 规范化后仍不同):fail-closed"%(s,p0.get("cwd"),expect[s]))
-        tabs.add(pane.get("tab_id")); hook_live=True
+        hook_live=True
     else:
         w=s+"-"+tag; a=got.get(w)
         if a is None:
@@ -588,15 +600,19 @@ for s in slots:                                         # 顺序:先全部在场
         tabs.add(a.get("tab_id"))
 if len(tabs)>1: bad("成员不在同一 tab: "+", ".join(sorted(str(t) for t in tabs)))
 if hook_live:                                           # 有在场无钩子实例:落盘 ACK 必须等于**重建**的期望
-    want="bootstrap-id: "+taskid+"\ntag: "+tag+"\n"+"".join(s+"-"+tag+"\n" for s in slots)
+    want=("bootstrap-id: "+taskid+"\ntag: "+tag+"\n"+"".join(s+"-"+tag+"\n" for s in slots)).encode("utf-8")
     n_exp=len(slots)+2
-    ef=os.path.join(td,"ack-expected")
-    if os.path.exists(ef) and open(ef,encoding="utf-8").read()!=want:
+    def rbytes(name):                                    # rb 读:不做换行标准化——文本模式会把 CRLF 折成 LF,
+        f=os.path.join(td,name)                          # 那样 CRLF 的 ACK 也会"全等",与"逐字节"的判据不符
+        if not os.path.exists(f): return None
+        with open(f,"rb") as fh: return fh.read()
+    ef=rbytes("ack-expected")
+    if ef is not None and ef!=want:
         bad("落盘 ack-expected 与按任务身份重建的期望不同:身份没显式更新或被改过,fail-closed")
-    af=os.path.join(td,"bootstrap-ack.md")
-    ack=open(af,encoding="utf-8").read() if os.path.exists(af) else ""
+    ack=rbytes("bootstrap-ack.md")
+    if ack is None: ack=b""
     if ack!=want:
-        bad("无钩子槽位复用的落盘 ACK 身份不成立:与按任务身份重建的 %d 行期望不全等(空/错 tag/错 bootstrap-id/错成员序都算):fail-closed,人工确认"%n_exp)
+        bad("无钩子槽位复用的落盘 ACK 身份不成立:与按任务身份重建的 %d 行 %d 字节期望**逐字节**不等(空/错 tag/错 bootstrap-id/错成员序/CRLF/尾空格/多余字节都算):fail-closed,人工确认"%(n_exp,len(want)))
 open(os.path.join(td,"missing-slots.txt"),"w",encoding="utf-8").write(" ".join(missing)+"\n")
 if missing:
     print("缺: "+", ".join(s+"-"+tag+"("+why[s]+")" for s in missing)+":只补缺,只对这几格动手,已在场成员一个都不重启")
@@ -711,9 +727,10 @@ fi
 # 3) 起代理循环:按槽位查"后端档案",权限参数取自"模式选择"的数组,**模型/推理档逐槽位**从规范 roster 合成;
 #    写死 bypass/auto 属流程违规,把模型写死在共用数组里同样属流程违规(同 CLI 的两格会互相顶掉)。
 #    分流按该槽位的 **cli**(不是槽位名):herdr agent start 需要 --kind(kimi/codex/claude 等);
-#    档案声明"无钩子"的成员(genox)不进注册表,改由 pane 直起(`pane run genox`;当前已装版 3.0.1 裸 `genox` 报
-#    `Missing command`(实测,退出码 2),暂用 `genox chat`;上游 PR 合并后裸命令与之等价——该等价性 **[未实测]**,
-#    见"后端档案"genox 条),不伪造 kind 注册、也不因它没进 agent list 就判"缺成员"。
+#    档案声明"无钩子"的成员(genox)不进注册表,改由 pane 直起:**交互命令就是裸 `genox`**
+#    (`pane run genox`;2026-10-10 在本机复测 Genox 3.0.1:裸命令进交互界面,读到 EOF 打 `Goodbye!`、退出码 0)。
+#    旧记录"3.0.1 的旧包裸命令报 `Missing command`、暂用 `genox chat`"是**历史测量**(当时那个包的行为),
+#    已被上一条取代,只作旧版本回溯用;不伪造 kind 注册、也不因它没进 agent list 就判"缺成员"。
 SLOT_ARGS=()                                            # 合成产物:每次调用前清空
 slot_argv_of() {                                        # $1 = slot:只从该槽位的规范 roster 声明合成(闸⑧已挡住"声明了却没有 flag"的入参)
   SLOT_ARGS=()
@@ -735,7 +752,7 @@ for s in $START_SLOTS; do
   [ -n "$pane" ] || { echo "槽位 $s 没有 pane(裂 pane 循环未赋值):停下人工确认"; exit 1; }
   slot_argv_of "$s" || exit 1
   case "${CLI_OF[$s]}" in
-    genox)  herdr pane run "$pane" "genox chat" ;;                    # 无钩子:唯一可用档=有人在场;参数见"后端档案"
+    genox)  herdr pane run "$pane" "genox" ;;                         # 无钩子:唯一可用档=有人在场;交互命令=裸 genox(见"后端档案")
     kimi)   herdr agent start "$s-$TAG" --kind kimi   --pane "$pane" -- "${KIMI_ARGS[@]}"   "${SLOT_ARGS[@]}" ;;
     codex)  herdr agent start "$s-$TAG" --kind codex  --pane "$pane" -- "${CODEX_ARGS[@]}"  "${SLOT_ARGS[@]}" ;;
     claude) herdr agent start "$s-$TAG" --kind claude --pane "$pane" -- "${CLAUDE_ARGS[@]}" "${SLOT_ARGS[@]}" ;;
@@ -771,22 +788,43 @@ START_SLOTS=${START_SLOTS-$SLOTS}          # 同上:**没给值**(单独抽取�
 #   新建:身份号 = 首次流程块铸的 CREATE_ID(已写进 manifest),本块只读不改;
 #   重入且本次真起了代理(补缺/重组):**显式换新身份号**——先原子改写 manifest 的 bootstrap-id 行,再据此重建 ACK 期望。
 #     不许隐式沿用旧身份号:旧 ACK 认的正是旧号,不换号就等于"新旧两批成员共用一张回执",身份链断了也看不出来。
+#     改写的临时文件必须**当场安全创建**:用 tempfile.mkstemp 在任务目录里现开一个唯一名(O_CREAT|O_EXCL,
+#     名字已被占——包括被预置成符号链接——只会换名重试,**绝不会打开并跟随**既有目录项),写完核属主/普通文件/
+#     仍在任务目录内,再 os.replace 换目录项;任一步不过就删掉临时文件退出。
+#     不能用固定的 `<manifest>.tmp` 先写后换:那是"先查后写",预置的同名链接会先被 open 跟随,
+#     把任务目录外的文件整篇覆盖、manifest 自己也变成链接(2026-10-10 复审实测)。
 #   重入且一个都没起(REUSE=ok):沿用 manifest 里的身份号,不重发 bootstrap(成员都在场,旧 ACK 依然有效)。
 if [ -n "$START_SLOTS" ] && [ "$CLASSIFY" = reentry ]; then
   TASK_ID=$(date +%s)-$RANDOM
   python3 - "$TD/manifest.txt" "$TASK_ID" <<'PY' || { echo "重组换任务身份号失败(manifest 改不动):fail-closed,人工确认"; exit 1; }
-import os, sys
+import os, stat, sys, tempfile
 path, tid = sys.argv[1], sys.argv[2]
+d = os.path.dirname(path) or "."
 with open(path, encoding="utf-8") as f:
     lines = f.read().splitlines()
 hit = [i for i, x in enumerate(lines) if x.startswith("bootstrap-id: ")]
 if len(hit) != 1:
     sys.exit("manifest 的 bootstrap-id 行不是恰好一条:fail-closed,人工确认")
 lines[hit[0]] = "bootstrap-id: " + tid
-tmp = path + ".tmp"
-with open(tmp, "w", encoding="utf-8") as f:
-    f.write("\n".join(lines) + "\n")
-os.replace(tmp, path)                      # 同目录改写:要么旧全文、要么新全文,不留半截文件
+data = ("\n".join(lines) + "\n").encode("utf-8")
+fd, tmp = tempfile.mkstemp(dir=d, prefix=".manifest.", suffix=".tmp")
+try:
+    with os.fdopen(fd, "wb") as f:
+        f.write(data); f.flush(); os.fsync(f.fileno())
+    st = os.lstat(tmp)
+    if not stat.S_ISREG(st.st_mode) or st.st_uid != os.getuid():
+        sys.exit("临时文件不是本用户的普通文件:fail-closed,人工确认")
+    if os.path.dirname(os.path.realpath(tmp)) != os.path.realpath(d):
+        sys.exit("临时文件规范化后不在任务目录内:fail-closed,人工确认")
+    os.replace(tmp, path)
+except BaseException:
+    try:
+        os.unlink(tmp)
+    except OSError:
+        pass
+    raise
+if os.path.islink(path) or not stat.S_ISREG(os.lstat(path).st_mode):
+    sys.exit("改写后 manifest 不是普通文件:fail-closed,人工确认")
 PY
 fi
 [ -n "${TASK_ID:-}" ] || { echo "任务身份号为空(新建/重入都没铸):fail-closed,人工确认"; exit 1; }
@@ -915,7 +953,7 @@ rmdir "$TD/launch.lock"                    # ACK 通过 = 拉起完成,释放排
 
 ## 后端档案(backend profile)
 
-> 每个后端 CLI 一条档案:**kind 名 / 健康检查(按状态钩子有无分流) / 参数组(无人值守、有人在场) / deny 挂载能力 / 状态钩子有无 / 专属注记**。第 0 步"起代理循环"按槽位的 cli 来这里取参数;第 0 步"模式选择"按这里的两行表逐 CLI 取显式参数。**raw CLI 的 CLI 专属经验(如网络出口)记在这里,第 3 步正文只留通用规则。**
+> 每个后端 CLI 一条档案:**kind 名 / 健康检查(按状态钩子有无分流) / 参数组(无人值守、有人在场) / 字段→启动 flag 表 / deny 挂载能力 / 状态钩子有无 / 专属注记**。第 0 步"起代理循环"按槽位的 cli 来这里取参数;第 0 步"模式选择"按这里的两行表逐 CLI 取显式参数。**raw CLI 的 CLI 专属经验(如网络出口)记在这里,第 3 步正文只留通用规则。**
 
 **参数组表(无人值守/有人在场 两行 × 每个档案化 CLI 一列)**:
 
@@ -927,7 +965,17 @@ rmdir "$TD/launch.lock"                    # ACK 通过 = 拉起完成,释放排
 | ↑ 注 | roster 里出现**多个 claude 系槽位**(如 `exec=claude` + `exec2=claude`)**各实例逐条挂载同一份 `--settings` deny 清单**:清单是**按实例挂载**的,不是"只绑某一个槽位"——现行"只绑 `exec` 槽位、不影响用户单开 claude"的结论正是按实例挂载的证明;新增 claude 系槽位时,启动循环里照样带 `--settings`,一个都不落 | | | |
 | ↑ 注(codex) | **网络出口(作者环境限定,不是通用事实)**:作者环境 codex 走 VPN、kimi/deepseek 不走——只有 codex 掉线时先查 VPN;各人按自己的出口情况类比排查(第 3 步的重递判据用这条) | | | |
 | copilot / opencode / 其它替补 | 以该 CLI `--help` 实测为准(**逐 CLI 验收**,不套用上面的值) | 同左,显式人工档 | 无 | 补 `herdr integration install <agent>` 后有 |
-| **genox** | **无**(见下) | 交互式 `genox chat`(有人在场档为其唯一可用档) | **无** | **无**(herdr 无 genox kind/integration) |
+| **genox** | **无**(见下) | 交互式**裸 `genox`**(有人在场档为其唯一可用档;旧包才需要 `genox chat`,见 genox 条) | **无** | **无**(herdr 无 genox kind/integration) |
+
+**字段 → 启动 flag 表(roster 声明的 model/effort 只有在本表里有对应 flag 才放行:第 1 步 ⑧ 按它判,起代理循环的 `slot_argv_of()` 按它合成)**:
+
+| CLI | model | effort | 合成写法 |
+|---|---|---|---|
+| kimi | 有 | 无 | `-m <model>`;声明 effort 即拒(本表没有该 flag) |
+| codex | 有 | 有 | `-m <model>` + `-c model_reasoning_effort=<effort>` |
+| claude | 有 | 有 | `--model <model>` + `--effort <level>` |
+| copilot / opencode / 其它替补 | 以该 CLI `--help` 实测为准 | 同左 | 未登记的 CLI 一旦声明 model/effort,`slot_argv_of()` 直接拒(不静默丢弃);实测登记后再补进本表 |
+| **genox** | **无** | **无** | 交互命令不收模型参数,声明即拒 |
 
 **健康检查(按档案的"状态钩子有无"分流,不搞一刀切)**:① `command -v <cli>` 二进制在——**所有后端**都要核;② `herdr integration status` 显示 `current`——**只有档案声明"有钩子"的后端**才核,**无 kind 的后端(genox)②必然缺失,不核也不补装**,按备胎处理:`agent get` 观测失效,只能 `pane read`。两档还各分两个时点(见"组队与替补"):**启动前**只核二进制与账号/模型可用性;**启动后**才核 pane 在场、pane 内进程存活、落盘 ACK 身份——选人阶段不该要求尚未存在的 pane/ACK。
 
@@ -935,9 +983,9 @@ rmdir "$TD/launch.lock"                    # ACK 通过 = 拉起完成,释放排
 
 **[真实执行] 事实(证据均在 `/tmp/genox/T001-b-evidence/`,Genox 3.0.1)**:
 
-- **交互命令与 flag**:交互启动命令主写**裸 `genox`**;当前已装版 3.0.1 裸 `genox` 报 `Missing command`(实测,退出码 2,证据 `05-genox-noargs.stderr`),**暂用 `genox chat`**;上游 PR 合并后裸命令与 `genox chat` 等价——**该等价性 [未实测]**;flag 仅 `--base-dir/-d`、`--verbose/-v`、`--help`;**chat 无免确认参数**(证据 `10-help-chat.stdout`);
+- **交互命令与 flag**:交互启动命令 = **裸 `genox`**,这是**当前实测状态**——2026-10-10 在本机(Genox 3.0.1,pull 后)复测:裸 `genox` 直接进交互界面,读到 EOF 打 `Goodbye!`、**退出码 0、不挂死**;**历史测量(旧包)**:当时的 3.0.1 裸命令报 `Missing command`(退出码 2,证据 `05-genox-noargs.stderr`),故一度暂用 `genox chat` 并记"两者等价 [未实测]"——该旧记录只用于回溯旧版本,不再是当前事实;flag 仅 `--base-dir/-d`、`--verbose/-v`、`--help`;**chat 无免确认参数**(证据 `10-help-chat.stdout`);
 - **免确认 flag 在 `genox run`**:`--approve-generated-plan`(生成计划并直接批准,不问人)与 `--plan FILE --approve-plan`(批准给定计划文件);源码 `run_preflight.py:292-318` 明确 `interactively_reviewed=False` 且无 TTY 且未批准时报 "No TTY is available and the master plan is unconfirmed. Use --plan FILE --approve-plan or --approve-generated-plan."(证据 `72-approval-source-scan.txt`、`73-interactive-detection.txt`)。**端到端无人值守跑通 = [未实测]**:本机无外网,TCP 连 `api.openai.com:443` 立即 `Network is unreachable`(证据 `50-network-probe.txt`),两条路径都死在模型调用(证据 `41-run-approve-generated-plan.stdout`、`53-run-plan-file2.stdout`);
-- **无 TTY 行为**:`genox chat` 无 TTY + `</dev/null` → 打 banner 与 `>` 提示符后读到 EOF 即打印 `Goodbye!`,**退出码 0,不挂死**(证据 `30-chat-null-stdin.stdout`/`.exit`);pty 里实测到达交互提示符、`/quit` 干净退出(证据 `32-chat-pty.raw`);退出码约定 **0 正常 / 2 用法错误 / 1 业务拒绝**(证据 `06-genox-badflag.exit`);
+- **无 TTY 行为**:**裸 `genox`** 读到 EOF 即打印 `Goodbye!`,**退出码 0,不挂死**(2026-10-10 复测,当前事实);**历史测量**:`genox chat` 无 TTY + `</dev/null` → 打 banner 与 `>` 提示符后读到 EOF 打印 `Goodbye!`,退出码 0(证据 `30-chat-null-stdin.stdout`/`.exit`);pty 里实测到达交互提示符、`/quit` 干净退出(证据 `32-chat-pty.raw`);退出码约定 **0 正常 / 2 用法错误 / 1 业务拒绝**(证据 `06-genox-badflag.exit`);
 - **进程卫生**:`genox run` 加 **`--foreground`** 防协调进程脱离(不加会脱离终端);失败可能留陈旧 `.control.lock` 元数据(实测留下已死 pid 的锁文件,**不卡后续启动**——连续跑 3 次未 unlock 均正常),清道夫是 `genox unlock [slug] [--control]`(证据 `48-workspace-state.txt`、`49-lockpid-check.txt`、`10-help-unlock.stdout`);
 - **doctor 姿态**:`permission mode: workspace-write`、`allow_network: True`、`confirm_destructive: True`、bubblewrap 可用(mode auto)、builtin tools 76、mcp disabled;配置走**默认值 + 环境变量**,`~/.genox/` 仅缓存、无 settings/permission 配置文件(证据 `21-genox-doctor.stdout`、`20-genox-version.stdout`、`70-config-surface.txt`)。
 
@@ -1045,7 +1093,7 @@ rmdir "$TD/launch.lock"                    # ACK 通过 = 拉起完成,释放排
 | 15 | **先分类后取锁**(N3):空目录 → 分类"新建" → 取锁 → 建 manifest → ACK 全等 → 释放的完整链;**用 N=4 roster 整段抽跑**;残留目录(非空无 manifest)在取锁前被拒;同 TAG 并发抢锁被拒;**先分类后算路径:方案在新建时冻结进 manifest,重入只恢复不重推**(main-only 建好后再 `git init` 也必须仍按冻结方案) | **[真实执行] T001-d**(r5 原证据:`/tmp/skillfix/r5-evidence/lock-flow.txt`,4 分支 + 闸的顺序探针)+ **T001-i**(N=4 整段抽跑 + "main-only 建后 git init 再重入"样本判绿,见 `/tmp/genox/T001-i-evidence/`);真代理拉起[未实测] |
 | 16 | **成对约束校验器**:判绿 = 现行默认 trio;判红 = 同 CLI 对、跨 CLI 同 family 对;**报错措辞与 SKILL 写死文本一致**;闸脚本自证能红能绿 | **[真实执行] T001-d**(每类 ≥1 样本)+ **T001-i**(同一套闸脚本复跑,默认 trio 与两类同源反例仍判红;orch=genox 亦拒) |
 | 17 | **布局与命名**:N=2/3/4 的 pane 裂序(right→down 循环)与 rename 循环静态推演 + **N=3 与 r5 布局逐 pane 一致性核对** | **[静态推演]** + 真机拉起[未实测] |
-| 18 | **genox 槽位拉起**:启动命令真跑;免确认路径按 `/tmp/genox/T001-b-result.md` 回填;验证"有人在场 + pane 发指针 + 落盘 ACK"闭环可用桩对端跑通 | **[真实执行] T001-d**(依赖 T001-b);T001-b 已落证部分见"后端档案"genox 条;**端到端无人值守跑通仍 [未实测]**(本机无外网) |
+| 18 | **genox 槽位拉起**:启动命令真跑(当前交互命令 = **裸 `genox`**,2026-10-10 复测:进交互界面、EOF → `Goodbye!`、退出码 0);免确认路径按 `/tmp/genox/T001-b-result.md` 回填;验证"有人在场 + pane 发指针 + 落盘 ACK"闭环可用桩对端跑通 | **[真实执行] T001-d**(依赖 T001-b);T001-b 已落证部分见"后端档案"genox 条(其中 `genox chat` 的裸命令 `Missing command` 记录已改为**旧包历史测量**);**端到端无人值守跑通仍 [未实测]**(本机无外网) |
 | 19 | **落盘快照的写入边界**:agent-list / pane-list / pane-info-\<slot\> / missing-slots 落盘前逐条核(拒符号链接、核属主、核在任务目录内);任务目录外放哨兵文件,负例跑完哨兵必须原样 | **[真实执行] T001-i**(符号链接负例:写前拒、外部 sentinel 字节不变;见 `/tmp/genox/T001-i-evidence/`) |
 | 20 | **逐槽位模型/推理档**:同一 CLI 的两个槽位各按自己的 roster 声明合成 argv(同 CLI 不同 model/effort 不互相顶掉);声明了模型/推理档却无对应 flag 的字段**明确拒绝**,不静默丢弃;`orch` 必须是 kimi | **[真实执行] T001-i**(同 CLI 双槽位 argv 反例 + orch=genox 拒;见 `/tmp/genox/T001-i-evidence/`) |
 | 21 | **重组=显式换任务身份**:重入且本次真起了代理 → manifest 的 bootstrap-id 行原子改写为新号 → ACK 期望按新号重建 → 旧 ACK 随即作废;一个都没起(全可复用)时沿用原号、不重发 bootstrap | **[真实执行] T001-i**(换号后旧 ACK 判红、新 ACK 判绿;见 `/tmp/genox/T001-i-evidence/`) |
