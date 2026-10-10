@@ -283,7 +283,9 @@ if [ "$CLASSIFY" = reentry ]; then
   # N is read from the roster line (no second parse in shell); the expected paths are computed per slot by this process from the
   # path plan and passed in, and both sides are normalized with realpath before comparing. stdout emits exactly N verified paths
   # in fixed slot order, for the shell to read back line by line.
-  _mout=$(python3 - "$TAG" "$ROOT" "$TD/manifest.txt" "$SLOTS" $(for s in $SLOTS; do echo "$s"; echo "$(expect_of "$s")"; done) <<'PY'
+  _eargs=()                                             # slot/expected-path pairs go in as a **referenced array**: a path containing spaces stays one argv, never split
+  for s in $SLOTS; do _eargs+=("$s" "$(expect_of "$s")"); done
+  _mout=$(python3 - "$TAG" "$ROOT" "$TD/manifest.txt" "$SLOTS" "${_eargs[@]}" <<'PY'
 import os, sys
 tag, root, path = sys.argv[1:4]
 slots = sys.argv[4].split()                             # $SLOTS arrives as a space-separated **string**: it must be split into a list, or list-vs-string never compares equal

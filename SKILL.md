@@ -270,7 +270,9 @@ if [ "$CLASSIFY" = reentry ]; then
   # cwd 行数 == N、cwd 槽位集合 == roster 行的槽位集合、逐槽位 realpath 比对。
   # N 从 roster 行读出(不用 shell 二次解析);预期路径由本进程按 path plan 逐槽位算出后传入,
   # 两侧都过 realpath 规范化再比。stdout 只出 N 条已验路径,按槽位固定序,供 shell 逐行取回。
-  _mout=$(python3 - "$TAG" "$ROOT" "$TD/manifest.txt" "$SLOTS" $(for s in $SLOTS; do echo "$s"; expect_of "$s"; done) <<'PY'
+  _eargs=()                                             # 槽位/预期路径成对进**引用的数组**:含空格的路径整条是一个 argv,不被拆开
+  for s in $SLOTS; do _eargs+=("$s" "$(expect_of "$s")"); done
+  _mout=$(python3 - "$TAG" "$ROOT" "$TD/manifest.txt" "$SLOTS" "${_eargs[@]}" <<'PY'
 import os, sys
 tag, root, path = sys.argv[1:4]
 slots = sys.argv[4].split()                             # $SLOTS 传进来是空格分隔的**字符串**:必须 split 成 list,否则 list 比 string 恒不相等
