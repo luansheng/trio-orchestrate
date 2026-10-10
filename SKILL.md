@@ -507,7 +507,7 @@ done
 
 # 3) 起代理循环:按槽位查"后端档案",参数取自"模式选择"的数组;写死 bypass/auto 属流程违规。
 #    分流按该槽位的 **cli**(不是槽位名):herdr agent start 需要 --kind(kimi/codex/claude 等);
-#    档案声明"无钩子"的成员(genox)不进注册表,改由 pane 直起(`pane run genox chat`,见"后端档案"genox 条),
+#    档案声明"无钩子"的成员(genox)不进注册表,改由 pane 直起(`pane run genox`;当前已装版 3.0.1 暂用 `genox chat`,见"后端档案"genox 条),
 #    不伪造 kind 注册、也不因它没进 agent list 就判"缺成员"。
 for s in $SLOTS; do
   pane=${PANE_OF[$s]}
@@ -680,7 +680,7 @@ rmdir "$TD/launch.lock"                    # ACK 通过 = 拉起完成,释放排
 
 **[真实执行] 事实(证据均在 `/tmp/genox/T001-b-evidence/`,Genox 3.0.1)**:
 
-- **交互命令与 flag**:`genox chat`,flag 仅 `--base-dir/-d`、`--verbose/-v`、`--help`;**chat 无免确认参数**(证据 `10-help-chat.stdout`);
+- **交互命令与 flag**:交互启动命令主写**裸 `genox`**;当前已装版 3.0.1 裸 `genox` 报 `Missing command`(实测,退出码 2,证据 `05-genox-noargs.stderr`),**暂用 `genox chat`**;上游 PR 合并后裸命令与 `genox chat` 等价——**该等价性 [未实测]**;flag 仅 `--base-dir/-d`、`--verbose/-v`、`--help`;**chat 无免确认参数**(证据 `10-help-chat.stdout`);
 - **免确认 flag 在 `genox run`**:`--approve-generated-plan`(生成计划并直接批准,不问人)与 `--plan FILE --approve-plan`(批准给定计划文件);源码 `run_preflight.py:292-318` 明确 `interactively_reviewed=False` 且无 TTY 且未批准时报 "No TTY is available and the master plan is unconfirmed. Use --plan FILE --approve-plan or --approve-generated-plan."(证据 `72-approval-source-scan.txt`、`73-interactive-detection.txt`)。**端到端无人值守跑通 = [未实测]**:本机无外网,TCP 连 `api.openai.com:443` 立即 `Network is unreachable`(证据 `50-network-probe.txt`),两条路径都死在模型调用(证据 `41-run-approve-generated-plan.stdout`、`53-run-plan-file2.stdout`);
 - **无 TTY 行为**:`genox chat` 无 TTY + `</dev/null` → 打 banner 与 `>` 提示符后读到 EOF 即打印 `Goodbye!`,**退出码 0,不挂死**(证据 `30-chat-null-stdin.stdout`/`.exit`);pty 里实测到达交互提示符、`/quit` 干净退出(证据 `32-chat-pty.raw`);退出码约定 **0 正常 / 2 用法错误 / 1 业务拒绝**(证据 `06-genox-badflag.exit`);
 - **进程卫生**:`genox run` 加 **`--foreground`** 防协调进程脱离(不加会脱离终端);失败可能留陈旧 `.control.lock` 元数据(实测留下已死 pid 的锁文件,**不卡后续启动**——连续跑 3 次未 unlock 均正常),清道夫是 `genox unlock [slug] [--control]`(证据 `48-workspace-state.txt`、`49-lockpid-check.txt`、`10-help-unlock.stdout`);

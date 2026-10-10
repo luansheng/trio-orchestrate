@@ -532,7 +532,7 @@ done
 #    hard-coding bypass/auto is a process violation.
 #    The branch is on that slot's **cli** (not on the slot name): `herdr agent start` needs --kind (kimi/codex/claude etc.);
 #    a member whose profile declares "no hook" (genox) does not enter the registry and is started directly in its pane instead
-#    (`pane run genox chat`, see the genox entry under "Backend profiles") — never fake a kind to register it, and never call it
+#    (`pane run genox`; with the installed 3.0.1 use `genox chat` for now — see the genox entry under "Backend profiles") — never fake a kind to register it, and never call it
 #    "missing" just because it is absent from agent list.
 for s in $SLOTS; do
   pane=${PANE_OF[$s]}
@@ -711,7 +711,7 @@ Until the hard boundaries behind items 1–3 above (remote protection, credentia
 
 **[Real execution] facts (all evidence under `/tmp/genox/T001-b-evidence/`, Genox 3.0.1)**:
 
-- **Interactive command and flags**: `genox chat`, flags only `--base-dir/-d`, `--verbose/-v`, `--help`; **chat has no no-confirmation parameter** (evidence `10-help-chat.stdout`);
+- **Interactive command and flags**: the interactive launch command is written as bare **`genox`**; with the installed 3.0.1, bare `genox` reports `Missing command` (measured, exit code 2, evidence `05-genox-noargs.stderr`), so **use `genox chat` for now**; once the upstream PR lands, the bare command is equivalent to `genox chat` — **that equivalence is [not tested]**; flags only `--base-dir/-d`, `--verbose/-v`, `--help`; **chat has no no-confirmation parameter** (evidence `10-help-chat.stdout`);
 - **The no-confirmation flags are on `genox run`**: `--approve-generated-plan` (generate a plan and approve it directly, without asking anyone) and `--plan FILE --approve-plan` (approve a given plan file); the source `run_preflight.py:292-318` makes clear it is `interactively_reviewed=False` and, with no TTY and no approval, reports "No TTY is available and the master plan is unconfirmed. Use --plan FILE --approve-plan or --approve-generated-plan." (evidence `72-approval-source-scan.txt`, `73-interactive-detection.txt`). **End-to-end unattended completion = [not tested]**: this machine has no external network, a TCP connect to `api.openai.com:443` immediately gives `Network is unreachable` (evidence `50-network-probe.txt`), and both paths die at the model call (evidence `41-run-approve-generated-plan.stdout`, `53-run-plan-file2.stdout`);
 - **No-TTY behaviour**: `genox chat` with no TTY and `</dev/null` prints the banner and the `>` prompt, reads EOF and prints `Goodbye!`, **exit code 0, no hang** (evidence `30-chat-null-stdin.stdout`/`.exit`); in a pty it was measured reaching the interactive prompt and exiting cleanly on `/quit` (evidence `32-chat-pty.raw`); exit-code convention **0 normal / 2 usage error / 1 business rejection** (evidence `06-genox-badflag.exit`);
 - **Process hygiene**: add **`--foreground`** to `genox run` to stop the coordinator from detaching (without it, it leaves the terminal); a failure may leave stale `.control.lock` metadata (measured: a lock file left by a dead pid, which **does not block subsequent starts** — three consecutive runs without unlock all started normally), and the cleaner is `genox unlock [slug] [--control]` (evidence `48-workspace-state.txt`, `49-lockpid-check.txt`, `10-help-unlock.stdout`);
